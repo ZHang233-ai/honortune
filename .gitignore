@@ -1,0 +1,15 @@
+# 编译产物
+*.exe
+*.pdb
+*.obj
+
+# 个人截图与参考素材（含账号信息 / 桌面内容，不入库）
+_prompt.png
+screenshots/
+fullscreen.png
+
+# 本地配置与编辑器
+config.ini
+.vs/
+*.user
+*.suo
