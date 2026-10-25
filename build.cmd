@@ -1,5 +1,5 @@
 @echo off
-rem 编译 荣耀性能调控（无需安装任何 SDK，使用系统自带 .NET Framework 编译器）
+rem 编译 💊性能调控（无需安装任何 SDK，使用系统自带 .NET Framework 编译器）
 cd /d "%~dp0"
 set CSC=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe
 if not exist "%CSC%" set CSC=%WINDIR%\Microsoft.NET\Framework\v4.0.30319\csc.exe

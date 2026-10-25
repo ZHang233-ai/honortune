@@ -1,4 +1,4 @@
-// 荣耀性能调控 (Honor Tune) — 单文件 WinForms 应用
+// 💊性能调控 (Honor Tune) — 单文件 WinForms 应用
 // 编译: csc /codepage:65001 /target:winexe /out:HonorTune.exe HonorTune.cs /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Management.dll
 using System;
 using System.Collections.Generic;
@@ -7,12 +7,20 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
 using System.Management;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
+
+[assembly: AssemblyTitle("💊性能调控")]
+[assembly: AssemblyDescription("💊性能调控 (Honor Tune)")]
+[assembly: AssemblyProduct("Honor Tune")]
+[assembly: AssemblyVersion("1.3.0.0")]
+[assembly: AssemblyFileVersion("1.3.0.0")]
+[assembly: AssemblyCopyright("MIT License")]
 
 // ============================================================
 //  主题与绘制工具
