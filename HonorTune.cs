@@ -18,8 +18,8 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("💊性能调控")]
 [assembly: AssemblyDescription("💊性能调控 (Honor Tune)")]
 [assembly: AssemblyProduct("Honor Tune")]
-[assembly: AssemblyVersion("1.3.0.0")]
-[assembly: AssemblyFileVersion("1.3.0.0")]
+[assembly: AssemblyVersion("1.3.1.0")]
+[assembly: AssemblyFileVersion("1.3.1.0")]
 [assembly: AssemblyCopyright("MIT License")]
 
 // ============================================================
@@ -30,6 +30,9 @@ static class Th
     public static Color Hex(string h) { return ColorTranslator.FromHtml(h); }
 
     public static readonly Color Bg = Hex("#0C0E13");
+    public static readonly Color Bar = Hex("#141827");
+    public const int BarH = 54;
+    public const int WinRad = 16;
     public static readonly Color Side = Hex("#11141D");
     public static readonly Color Card = Hex("#161A26");
     public static readonly Color CardHot = Hex("#1B2033");
@@ -135,6 +138,26 @@ static class Th
     public static Color Alpha(Color c, int a)
     {
         return Color.FromArgb(a, c.R, c.G, c.B);
+    }
+
+    // 顶栏渐变。formY 是这块区域在窗口客户区里的 Y，子控件也能对上同一条渐变。
+    public static void PaintBar(Graphics g, int x, int y, int w, int h, int formY)
+    {
+        GraphicsState st = g.Save();
+        g.TranslateTransform(x, y - formY);
+        using (LinearGradientBrush lb = new LinearGradientBrush(
+            new Rectangle(0, 0, Math.Max(w, 2), BarH + 2), Bar, Bg, 90f))
+            g.FillRectangle(lb, 0, formY, w, h);
+        g.Restore(st);
+    }
+
+    public static void ClipWindow(Form f, int rad)
+    {
+        int w = f.ClientSize.Width;
+        int h = f.ClientSize.Height;
+        if (w < rad * 2 || h < rad * 2) return;
+        using (GraphicsPath p = Round(new Rectangle(0, 0, w, h), rad))
+            f.Region = new Region(p);
     }
 
     // 卡片底板
@@ -1305,21 +1328,46 @@ abstract class Px : Control
 class WinBtn : Px
 {
     public int Kind; // 0 = min, 1 = close
-    public WinBtn() { Cursor = Cursors.Hand; BackColor = Th.Bg; }
+    public WinBtn()
+    {
+        Cursor = Cursors.Hand;
+        BackColor = Th.Bar;
+        TabStop = false;
+        SetStyle(ControlStyles.Opaque, true);
+    }
+
+    protected override void OnPaintBackground(PaintEventArgs e)
+    {
+        Th.PaintBar(e.Graphics, 0, 0, Width, Height, Top);
+    }
 
     protected override void OnPaint(PaintEventArgs e)
     {
         Graphics g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
-        if (Hot)
-            Th.Fill(g, new Rectangle(0, 0, Width, Height), 7, Kind == 1 ? Th.Alpha(Th.Bad, 200) : Th.StrokeHot);
-        using (Pen p = new Pen(Kind == 1 && Hot ? Color.White : Th.Text2, 1.4f))
+        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        Th.PaintBar(g, 0, 0, Width, Height, Top);
+        if (Hot || Down)
         {
-            if (Kind == 0) g.DrawLine(p, Width / 2 - 5, Height / 2 + 1, Width / 2 + 5, Height / 2 + 1);
+            Color fill = Kind == 1
+                ? (Down ? Th.Hex("#C93642") : Th.Hex("#E5484D"))
+                : Th.Alpha(Th.Text, Down ? 40 : 26);
+            Th.Fill(g, new Rectangle(1, 1, Width - 2, Height - 2), 8, fill);
+        }
+        Color ink = (Kind == 1 && (Hot || Down)) ? Color.White : (Hot ? Th.Text : Th.Text2);
+        using (Pen p = new Pen(ink, 1.7f))
+        {
+            p.StartCap = LineCap.Round;
+            p.EndCap = LineCap.Round;
+            float cx = Width / 2f;
+            float cy = Height / 2f + 0.5f;
+            if (Kind == 0)
+                g.DrawLine(p, cx - 5.5f, cy, cx + 5.5f, cy);
             else
             {
-                g.DrawLine(p, Width / 2 - 4, Height / 2 - 4, Width / 2 + 4, Height / 2 + 4);
-                g.DrawLine(p, Width / 2 + 4, Height / 2 - 4, Width / 2 - 4, Height / 2 + 4);
+                float d = 4.4f;
+                g.DrawLine(p, cx - d, cy - d, cx + d, cy + d);
+                g.DrawLine(p, cx + d, cy - d, cx - d, cy + d);
             }
         }
     }
@@ -1661,7 +1709,7 @@ class PillBtn : Px
 class MainForm : Form
 {
     const int W = 1180, H = 740;
-    const int TitleH = 54;
+    const int TitleH = Th.BarH;
     const int SideW = 220;
 
     Core core;
@@ -1697,6 +1745,7 @@ class MainForm : Form
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.CenterScreen;
         ClientSize = new Size(W, H);
+        Th.ClipWindow(this, Th.WinRad);
         BackColor = Th.Bg;
         Text = "荣耀性能调控";
         try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
@@ -2071,6 +2120,7 @@ class MainForm : Form
             d.StartPosition = FormStartPosition.CenterScreen;
             d.ClientSize = new Size(400, 150);
             d.BackColor = Th.Card;
+            Th.ClipWindow(d, 12);
             d.TopMost = true;
             d.ShowInTaskbar = false;
 
@@ -2167,9 +2217,7 @@ class MainForm : Form
         g.Clear(Th.Bg);
 
         // 顶栏
-        using (LinearGradientBrush lb = new LinearGradientBrush(new Rectangle(0, 0, W, TitleH + 2),
-            Th.Hex("#141827"), Th.Bg, 90f))
-            g.FillRectangle(lb, 0, 0, W, TitleH);
+        Th.PaintBar(g, 0, 0, W, TitleH, 0);
         using (Pen p = new Pen(Th.Stroke)) g.DrawLine(p, 0, TitleH, W, TitleH);
         using (Pen p = new Pen(Th.Stroke)) g.DrawLine(p, SideW, TitleH, SideW, H);
 
@@ -2190,7 +2238,7 @@ class MainForm : Form
 
         // 侧栏底部
         Th.TL(g, ModelName(), Th.FTiny, Th.Text3, 22, H - 92, SideW - 40, 16);
-        Th.TL(g, "v1.3 · 荣耀性能调整", Th.FTiny, Th.Alpha(Th.Text3, 160), 22, H - 72, SideW - 40, 16);
+        Th.TL(g, "v1.3.1 · 荣耀性能调整", Th.FTiny, Th.Alpha(Th.Text3, 160), 22, H - 72, SideW - 40, 16);
 
         if (page == 0) PaintPage0(g);
         else PaintPage2(g);
@@ -2199,8 +2247,8 @@ class MainForm : Form
             Th.TR(g, "⚠ 低权限运行 · 修改不会生效，请把 HonorTune.exe 复制到普通文件夹后再运行",
                 Th.FTiny, Th.Warn, 300, 15, 776, 24);
 
-        using (Pen bp = new Pen(Th.Hex("#2B3448")))
-            g.DrawRectangle(bp, 0, 0, W - 1, H - 1);
+        Th.Frame(g, new Rectangle(1, 1, ClientSize.Width - 3, ClientSize.Height - 3),
+            Th.WinRad - 1, Th.Hex("#2B3448"));
     }
 
     void Header(Graphics g, string title, string sub)
@@ -2385,6 +2433,16 @@ class MainForm : Form
         if (g == new Guid("961cc777-2547-4f9d-8174-7d86181b7a7a")) return "最佳能效";
         if (g == new Guid("961cc777-2547-4f9d-8174-7d86181b8a7a")) return "最佳能效";
         return "自定义";
+    }
+
+    Size clipped;
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        if (WindowState == FormWindowState.Minimized || clipped == ClientSize) return;
+        clipped = ClientSize;
+        Th.ClipWindow(this, Th.WinRad);
     }
 
     // ---------- 无边框窗口拖动 ----------
