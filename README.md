@@ -49,6 +49,7 @@ CPU 占用（带曲线）、内存、CPU 实时频率、GPU 温度、电池、�
 - **后台应用** —— 限制后台运行（对应「设置 › 隐私和安全性 › 后台应用」）。
 - **当前生效设置** —— 只读，直接读系统真实值。
 - **恢复到初始状态** —— 把改动全部还原。
+- **后台服务** —— 记住上次选的性能档和风扇转速。开机后由 Windows 服务重写，不弹出窗口；档位被管家或固件打掉时会再写回去。安装或卸载服务时要一次 UAC，平时开界面不用管理员。
 
 ![细节调节](docs/detail.png)
 
@@ -114,7 +115,7 @@ build.cmd
 ```
 %WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe /codepage:65001 /target:winexe ^
   /win32icon:app.ico /out:HonorTune.exe HonorTune.cs ^
-  /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Management.dll
+  /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Management.dll /r:System.ServiceProcess.dll
 ```
 
 C# 5 语法，任何 Windows 10/11 自带的 .NET Framework 4.x 都能跑。

@@ -10,6 +10,7 @@ fullscreen.png
 
 # 本地配置与编辑器
 config.ini
+HonorTune-data/
 .vs/
 *.user
 *.suo

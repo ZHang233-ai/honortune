@@ -9,6 +9,8 @@ using System.IO;
 using System.Management;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Principal;
+using System.ServiceProcess;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -18,8 +20,8 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("💊性能调控")]
 [assembly: AssemblyDescription("💊性能调控 (Honor Tune)")]
 [assembly: AssemblyProduct("Honor Tune")]
-[assembly: AssemblyVersion("1.3.1.0")]
-[assembly: AssemblyFileVersion("1.3.1.0")]
+[assembly: AssemblyVersion("1.3.2.0")]
+[assembly: AssemblyFileVersion("1.3.2.0")]
 [assembly: AssemblyCopyright("MIT License")]
 
 // ============================================================
@@ -1720,7 +1722,7 @@ class MainForm : Form
 
     NavBtn[] navs = new NavBtn[2];
     WinBtn winMin, winClose;
-    Toggle tgAnim, tgBg;
+    Toggle tgAnim, tgBg, tgBoot;
     Slider slDelay;
     List<Chip> chips = new List<Chip>();
     PillBtn[] quick = new PillBtn[3];
@@ -1760,8 +1762,11 @@ class MainForm : Form
         Disp.Load();
         mon.Sample();
         HonorEc.Refresh();
+        SeedKeep();
+        SyncStartup();
         HighlightHonor();
         SyncAll();
+        NoteResume();
 
         AppendLog("启动完成 · " + ModelName() + " · " + DateTime.Now.ToString("HH:mm"), true);
 
@@ -1841,6 +1846,16 @@ class MainForm : Form
             navs[i] = b;
             Controls.Add(b);
         }
+
+        tgBoot = new Toggle();
+        tgBoot.BackColor = Th.Side;
+        tgBoot.Bounds = new Rectangle(SideW - 52 - 16, H - 176, 52, 28);
+        tgBoot.Changed += delegate
+        {
+            if (syncing) return;
+            SetStartup(tgBoot.On);
+        };
+        Controls.Add(tgBoot);
     }
 
     void BuildPage0()
@@ -1984,15 +1999,11 @@ class MainForm : Form
     void HwModeClick(object s, EventArgs e)
     {
         int mode = (int)((Control)s).Tag;
-        bool ok = HonorEc.SetMode(mode);
-        HonorEc.Refresh();
-        AppendLog((ok ? "已切换荣耀性能模式：" : "切换荣耀性能模式失败：") + HonorEc.ModeName(mode), ok);
-        if (ok)
-        {
-            Guid want = mode == 0 ? PlanBalance : HonorPlan();
-            bool planOk = Nat.ActiveScheme() == want || Nat.SetActiveScheme(want);
-            AppendLog((planOk ? "电源计划已切到：" : "切换电源计划失败：") + Nat.FriendlyName(want), planOk);
-        }
+        int fan = cfg.GetInt("keep", "fan", HonorEc.FanIndex);
+        string msg = ApplyHonorChoice(mode, mode == 3 ? fan : -1);
+        bool ok = HonorEc.Mode == mode;
+        if (ok) Remember(mode, mode == 3 ? fan : -1);
+        AppendLog(msg, ok);
         HighlightHonor();
         Invalidate();
     }
@@ -2009,9 +2020,108 @@ class MainForm : Form
         string msg = ok ? "已下发风扇转速档位 " + (idx + 1) + "/5"
                         : "下发风扇转速档位失败 " + (idx + 1) + "/5";
         if (!ok && HonorEc.Error.Length > 0) msg += "：" + HonorEc.Error;
+        if (ok) Remember(3, idx);
         AppendLog(msg, ok);
         HighlightHonor();
         Invalidate();
+    }
+
+    // 登录后重选上次档位。fan < 0 表示这次不动风扇。
+    public static string ApplyHonorChoice(int mode, int fan)
+    {
+        if (mode != 0 && mode != 1 && mode != 3) return "没有可重选的性能档";
+        bool ok = HonorEc.SetMode(mode);
+        HonorEc.Refresh();
+        string msg = (ok ? "已重选性能档：" : "重选性能档失败：") + HonorEc.ModeName(mode);
+        if (!ok && HonorEc.Error.Length > 0) msg += "：" + HonorEc.Error;
+        if (!ok) return msg;
+        Guid want = mode == 0 ? PlanBalance : HonorPlan();
+        bool planOk = Nat.ActiveScheme() == want || Nat.SetActiveScheme(want);
+        msg += planOk ? "，电源计划已对齐" : "，电源计划切换失败";
+        if (mode == 3 && fan >= 0 && fan <= 4)
+        {
+            bool fanOk = HonorEc.SetFanIndex(fan);
+            msg += fanOk ? "，风扇 " + (fan + 1) + "/5" : "，风扇未生效";
+            if (!fanOk && HonorEc.Error.Length > 0) msg += "（" + HonorEc.Error + "）";
+        }
+        return msg;
+    }
+
+    void Remember(int mode, int fan)
+    {
+        if (mode == 0 || mode == 1 || mode == 3)
+            cfg.Set("keep", "mode", mode.ToString());
+        if (fan >= 0 && fan <= 4)
+            cfg.Set("keep", "fan", fan.ToString());
+        cfg.Save();
+        Boot.PublishKeep(cfg.GetInt("keep", "mode", -1), cfg.GetInt("keep", "fan", -1), cfg.Get("keep", "startup", "1") != "0");
+    }
+
+    void SeedKeep()
+    {
+        if (cfg.Get("keep", "mode", "").Length == 0 &&
+            (HonorEc.Mode == 0 || HonorEc.Mode == 1 || HonorEc.Mode == 3))
+            cfg.Set("keep", "mode", HonorEc.Mode.ToString());
+        if (cfg.Get("keep", "fan", "").Length == 0 && HonorEc.FanIndex >= 0 && HonorEc.FanIndex <= 4)
+            cfg.Set("keep", "fan", HonorEc.FanIndex.ToString());
+        if (cfg.Get("keep", "startup", "").Length == 0)
+            cfg.Set("keep", "startup", "1");
+        cfg.Save();
+        Boot.PublishKeep(cfg.GetInt("keep", "mode", -1), cfg.GetInt("keep", "fan", -1), cfg.Get("keep", "startup", "1") != "0");
+    }
+
+    void SyncStartup()
+    {
+        syncing = true;
+        tgBoot.On = Boot.ServiceInstalled();
+        syncing = false;
+    }
+
+    void SetStartup(bool on)
+    {
+        cfg.Set("keep", "startup", on ? "1" : "0");
+        cfg.Save();
+        Boot.PublishKeep(cfg.GetInt("keep", "mode", HonorEc.Mode), cfg.GetInt("keep", "fan", HonorEc.FanIndex), on);
+        if (Elev.IsAdmin())
+        {
+            bool ok = on ? Boot.InstallService() : Boot.RemoveService();
+            syncing = true;
+            tgBoot.On = Boot.ServiceInstalled();
+            syncing = false;
+            AppendLog(ok
+                ? (on ? "已安装后台服务：掉档会重设，不会打开主窗口" : "已停止并移除后台服务")
+                : "服务安装失败，请在 UAC 中允许后再试", ok);
+            return;
+        }
+        try
+        {
+            Elev.Relaunch(on ? "--install-service" : "--remove-service");
+            AppendLog(on ? "请在 UAC 中允许安装后台服务，主窗口不会开机自启" : "请在 UAC 中允许移除后台服务", true);
+        }
+        catch
+        {
+            syncing = true;
+            tgBoot.On = Boot.ServiceInstalled();
+            syncing = false;
+            AppendLog("未获得管理员权限，服务未更改", false);
+        }
+    }
+
+    void NoteResume()
+    {
+        try
+        {
+            string p = System.IO.Path.Combine(Boot.DataDir(), "service.log");
+            if (!File.Exists(p)) return;
+            if ((DateTime.Now - File.GetLastWriteTime(p)).TotalHours > 18) return;
+            string[] lines = File.ReadAllLines(p, Encoding.UTF8);
+            string last = "";
+            for (int i = lines.Length - 1; i >= 0; i--)
+                if (lines[i].Trim().Length > 0) { last = lines[i].Trim(); break; }
+            if (last.Length > 0)
+                AppendLog("开机保持 · " + last, last.IndexOf("失败") < 0 && last.IndexOf("未生效") < 0);
+        }
+        catch { }
     }
 
     void HighlightHonor()
@@ -2236,9 +2346,13 @@ class MainForm : Form
         Th.TL(g, "荣耀性能调控", Th.FTitle3, Th.Text, 58, 12, 400, 20);
         Th.TL(g, "HONOR TUNE", Th.FTiny, Th.Text3, 58, 30, 400, 14);
 
+        // 侧栏：后台服务，不启动主窗口
+        Th.TL(g, "后台服务", Th.FSmall, Th.Text2, 18, H - 176, 120, 20);
+        Th.TL(g, "掉档就重设", Th.FTiny, Th.Text3, 18, H - 156, 120, 16);
+
         // 侧栏底部
         Th.TL(g, ModelName(), Th.FTiny, Th.Text3, 22, H - 92, SideW - 40, 16);
-        Th.TL(g, "v1.3.1 · 荣耀性能调整", Th.FTiny, Th.Alpha(Th.Text3, 160), 22, H - 72, SideW - 40, 16);
+        Th.TL(g, "v1.3.2 · 荣耀性能调整", Th.FTiny, Th.Alpha(Th.Text3, 160), 22, H - 72, SideW - 40, 16);
 
         if (page == 0) PaintPage0(g);
         else PaintPage2(g);
@@ -2648,6 +2762,293 @@ static class Diag
 }
 
 // ============================================================
+//  UAC：只在安装/卸载后台服务时申请，不把主窗口提权后直接跑起来
+// ============================================================
+static class Elev
+{
+    public static bool IsAdmin()
+    {
+        try
+        {
+            WindowsIdentity id = WindowsIdentity.GetCurrent();
+            WindowsPrincipal pr = new WindowsPrincipal(id);
+            return pr.IsInRole(WindowsBuiltInRole.Administrator);
+        }
+        catch { return false; }
+    }
+
+    public static bool Relaunch(string args)
+    {
+        ProcessStartInfo psi = new ProcessStartInfo();
+        psi.FileName = Application.ExecutablePath;
+        psi.Arguments = args ?? "";
+        psi.UseShellExecute = true;
+        psi.Verb = "runas";
+        Process.Start(psi);
+        return true;
+    }
+}
+
+// ============================================================
+//  后台服务：保持上次性能档和风扇，不打开主窗口
+// ============================================================
+static class Boot
+{
+    const string SvcName = "HonorTuneKeep";
+    const string RunPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    const string RunName = "HonorTune";
+
+    public static string DataDir()
+    {
+        string dir = System.IO.Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "HonorTune");
+        try { Directory.CreateDirectory(dir); } catch { }
+        return dir;
+    }
+
+    public static string InstallDir()
+    {
+        string dir = System.IO.Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "HonorTune");
+        try { Directory.CreateDirectory(dir); } catch { }
+        return dir;
+    }
+
+    public static string KeepPath()
+    {
+        return System.IO.Path.Combine(DataDir(), "keep.ini");
+    }
+
+    public static bool ServiceInstalled()
+    {
+        return Sc("query " + SvcName) == 0;
+    }
+
+    public static void PublishKeep(int mode, int fan, bool on)
+    {
+        try
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("mode=" + mode);
+            sb.AppendLine("fan=" + fan);
+            sb.AppendLine("on=" + (on ? "1" : "0"));
+            File.WriteAllText(KeepPath(), sb.ToString(), Encoding.UTF8);
+        }
+        catch { }
+    }
+
+    public static bool ReadKeep(out int mode, out int fan, out bool on)
+    {
+        mode = -1;
+        fan = -1;
+        on = false;
+        try
+        {
+            if (!File.Exists(KeepPath())) return false;
+            foreach (string raw in File.ReadAllLines(KeepPath(), Encoding.UTF8))
+            {
+                int eq = raw.IndexOf('=');
+                if (eq <= 0) continue;
+                string k = raw.Substring(0, eq).Trim();
+                string v = raw.Substring(eq + 1).Trim();
+                if (k == "mode") int.TryParse(v, out mode);
+                else if (k == "fan") int.TryParse(v, out fan);
+                else if (k == "on") on = v != "0";
+            }
+            return mode == 0 || mode == 1 || mode == 3;
+        }
+        catch { return false; }
+    }
+
+    public static bool InstallService()
+    {
+        try
+        {
+            Cfg cfg = Cfg.Load();
+            HonorEc.Refresh();
+            int mode = cfg.GetInt("keep", "mode", HonorEc.Mode);
+            int fan = cfg.GetInt("keep", "fan", HonorEc.FanIndex);
+            if (mode != 0 && mode != 1 && mode != 3) mode = HonorEc.Mode;
+            PublishKeep(mode, fan, true);
+            cfg.Set("keep", "startup", "1");
+            if (mode == 0 || mode == 1 || mode == 3) cfg.Set("keep", "mode", mode.ToString());
+            if (fan >= 0 && fan <= 4) cfg.Set("keep", "fan", fan.ToString());
+            cfg.Save();
+
+            string exe = System.IO.Path.Combine(InstallDir(), "HonorTune.exe");
+            string src = Application.ExecutablePath;
+            Sc("stop " + SvcName);
+            Thread.Sleep(600);
+            if (!src.Equals(exe, StringComparison.OrdinalIgnoreCase))
+            {
+                try { File.Copy(src, exe, true); }
+                catch (Exception ex)
+                {
+                    WriteLog("复制服务程序失败：" + ex.Message);
+                    exe = src;
+                }
+            }
+            Sc("delete " + SvcName);
+            Thread.Sleep(400);
+            ClearLaunchers();
+            string bin = "binPath= \"\\\"" + exe + "\\\" --service\" start= auto DisplayName= \"HonorTune Keep\"";
+            int rc = Sc("create " + SvcName + " " + bin);
+            if (rc != 0)
+            {
+                WriteLog("创建服务失败 rc=" + rc);
+                return false;
+            }
+            Sc("description " + SvcName + " \"Reapply last performance mode and fan. Does not open the app.\"");
+            Sc("failure " + SvcName + " reset= 86400 actions= restart/5000/restart/15000/restart/60000");
+            rc = Sc("start " + SvcName);
+            WriteLog("服务已安装 mode=" + mode + " fan=" + fan + " start=" + rc + " exe=" + exe);
+            return rc == 0 || ServiceInstalled();
+        }
+        catch (Exception ex)
+        {
+            WriteLog("安装服务失败：" + ex.Message);
+            return false;
+        }
+    }
+
+    public static bool RemoveService()
+    {
+        PublishKeep(-1, -1, false);
+        Sc("stop " + SvcName);
+        Thread.Sleep(500);
+        int rc = Sc("delete " + SvcName);
+        ClearLaunchers();
+        WriteLog("服务已移除 rc=" + rc);
+        return rc == 0 || !ServiceInstalled();
+    }
+
+    static void ClearLaunchers()
+    {
+        try
+        {
+            using (RegistryKey k = Registry.CurrentUser.OpenSubKey(RunPath, true))
+                if (k != null) k.DeleteValue(RunName, false);
+        }
+        catch { }
+        try
+        {
+            ProcessStartInfo psi = new ProcessStartInfo("schtasks.exe", "/Delete /TN \"" + RunName + "\" /F");
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            using (Process p = Process.Start(psi))
+            {
+                p.StandardOutput.ReadToEnd();
+                p.StandardError.ReadToEnd();
+                p.WaitForExit(8000);
+            }
+        }
+        catch { }
+    }
+
+    static int Sc(string args)
+    {
+        try
+        {
+            ProcessStartInfo psi = new ProcessStartInfo("sc.exe", args);
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            using (Process p = Process.Start(psi))
+            {
+                string o = p.StandardOutput.ReadToEnd();
+                string e = p.StandardError.ReadToEnd();
+                if (!p.WaitForExit(15000)) return -1;
+                if (p.ExitCode != 0 && args.StartsWith("create", StringComparison.OrdinalIgnoreCase))
+                    WriteLog("sc " + args + " rc=" + p.ExitCode + " " + (o + e).Trim());
+                return p.ExitCode;
+            }
+        }
+        catch { return -1; }
+    }
+
+    public static void WriteLog(string text)
+    {
+        try
+        {
+            File.WriteAllText(System.IO.Path.Combine(DataDir(), "service.log"),
+                DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " " + text + "\r\n", Encoding.UTF8);
+        }
+        catch { }
+    }
+}
+
+class KeepService : ServiceBase
+{
+    Thread worker;
+    volatile bool stop;
+    bool forced;
+    int quiet;
+
+    public KeepService()
+    {
+        ServiceName = "HonorTuneKeep";
+        CanStop = true;
+        AutoLog = true;
+    }
+
+    protected override void OnStart(string[] args)
+    {
+        stop = false;
+        forced = false;
+        worker = new Thread(Loop);
+        worker.IsBackground = true;
+        worker.Start();
+    }
+
+    protected override void OnStop()
+    {
+        stop = true;
+        if (worker != null) worker.Join(4000);
+    }
+
+    void Loop()
+    {
+        Boot.WriteLog("服务启动，不打开主窗口");
+        for (int i = 0; i < 20 && !stop; i++)
+        {
+            HonorEc.Refresh();
+            if (HonorEc.Mode >= 0) break;
+            Thread.Sleep(2000);
+        }
+        int n = 0;
+        while (!stop)
+        {
+            try { Tick(n < 6); }
+            catch (Exception ex) { Boot.WriteLog("保持失败：" + ex.Message); }
+            n++;
+            int wait = n < 8 ? 15000 : 30000;
+            for (int i = 0; i < wait / 400 && !stop; i++) Thread.Sleep(400);
+        }
+    }
+
+    void Tick(bool soon)
+    {
+        int mode, fan;
+        bool on;
+        if (!Boot.ReadKeep(out mode, out fan, out on) || !on) return;
+        HonorEc.Refresh();
+        bool drift = HonorEc.Mode != mode;
+        if (mode == 3 && fan >= 0 && fan <= 4 && HonorEc.FanIndex != fan) drift = true;
+        quiet++;
+        bool reassert = soon || quiet >= 4;
+        if (!drift && forced && !reassert) return;
+        if (reassert) quiet = 0;
+        string msg = MainForm.ApplyHonorChoice(mode, fan);
+        forced = true;
+        if (drift || msg.IndexOf("失败") >= 0 || msg.IndexOf("未生效") >= 0)
+            Boot.WriteLog(msg);
+    }
+}
+
+// ============================================================
 //  入口
 // ============================================================
 static class Program
@@ -2655,8 +3056,35 @@ static class Program
     [STAThread]
     static void Main(string[] args)
     {
+        if (args != null && args.Length > 0 && args[0] == "--service")
+        {
+            ServiceBase.Run(new KeepService());
+            return;
+        }
+
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
+
+        if (args != null && args.Length > 0 &&
+            (args[0] == "--install-service" || args[0] == "--remove-service" || args[0] == "--arm"))
+        {
+            if (!Elev.IsAdmin())
+            {
+                try { if (Elev.Relaunch(args[0])) return; }
+                catch (Exception ex)
+                {
+                    Boot.WriteLog("未获得管理员权限：" + ex.Message);
+                    return;
+                }
+            }
+            try
+            {
+                if (args[0] == "--remove-service") Boot.RemoveService();
+                else Boot.InstallService();
+            }
+            catch (Exception ex) { Boot.WriteLog("ERR " + ex.Message); }
+            return;
+        }
 
         if (args.Length > 1 && args[0] == "--page")
         {
