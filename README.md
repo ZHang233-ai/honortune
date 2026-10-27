@@ -4,7 +4,8 @@
 
 在 **HONOR MagicBook DRA-XX（DarwinA / Core Ultra 5 125H + RTX 4060）** 上开发并逐项实测。
 
-![概览](docs/overview.png)
+![概览](<img width="1180" height="740" alt="QQ_1793112560859" src="https://github.com/user-attachments/assets/e22c6ca4-1c91-4c63-80a5-b5333e0cfd9f" />
+)
 
 ---
 
@@ -76,14 +77,9 @@ CPU 占用（带曲线）、内存、CPU 实时频率、GPU 温度、电池、�
 > CPU 频率读的是 `Processor Information\Actual Frequency`，和任务管理器一致。
 > 这颗混合架构 CPU 上 `Processor Frequency` 会一直显示 0.92 GHz，是错的。
 
-### 细节调节
+### GPU 超频
+<img width="1180" height="740" alt="QQ_1793112652934" src="https://github.com/user-attachments/assets/7bbbfbd9-fb47-4a76-bf7f-f328a65015e8" />
 
-- **刷新率** —— 列出当前分辨率支持的全部刷新率，点了立即生效；**15 秒内不确认自动回滚**，防止改黑了没法救。
-- **界面动画** —— 关闭最小化/菜单淡入/任务栏动画，可调菜单显示延迟 0–400 ms。
-- **后台应用** —— 限制后台运行（对应「设置 › 隐私和安全性 › 后台应用」）。
-- **当前生效设置** —— 只读，直接读系统真实值。
-- **恢复到初始状态** —— 把改动全部还原。
-- **后台服务** —— 记住上次选的性能档和风扇转速。开机后由 Windows 服务重写，不弹出窗口；档位被管家或固件打掉时会再写回去。安装或卸载服务时要一次 UAC，平时开界面不用管理员。
 
 ### 电池保护（侧栏第三项）
 
@@ -99,7 +95,8 @@ CPU 占用（带曲线）、内存、CPU 实时频率、GPU 温度、电池、�
 
 阈值存在 EC 里，重启、换系统都还在，不需要服务重设。
 
-![细节调节](docs/detail.png)
+<img width="1180" height="740" alt="QQ_1793112603038" src="https://github.com/user-attachments/assets/93d2315e-9499-47a7-82ae-fffaac15fa67" />
+
 
 ---
 
@@ -144,8 +141,6 @@ CPU 占用（带曲线）、内存、CPU 实时频率、GPU 温度、电池、�
 |---|---|
 | 切换电源方案 | `PowerSetActiveScheme` |
 | 刷新率 | `EnumDisplaySettings` 枚举 + `ChangeDisplaySettingsEx` |
-| 界面动画 | HKCU `MinAnimate` / `MenuShowDelay` / `TaskbarAnimations` + `WM_SETTINGCHANGE` |
-| 后台限制 | HKCU `BackgroundAccessApplications\GlobalUserDisabled` |
 | GPU 温度 | `nvidia-smi` |
 | GPU 频率偏移 | `nvapi64` → `NvAPI_GPU_SetPstates20`，核心/显存 P0 偏移，MHz×1000 |
 
