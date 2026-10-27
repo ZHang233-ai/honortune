@@ -20,8 +20,8 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("💊性能调控")]
 [assembly: AssemblyDescription("💊性能调控 (Honor Tune)")]
 [assembly: AssemblyProduct("Honor Tune")]
-[assembly: AssemblyVersion("1.3.2.0")]
-[assembly: AssemblyFileVersion("1.3.2.0")]
+[assembly: AssemblyVersion("1.4.0.0")]
+[assembly: AssemblyFileVersion("1.4.0.0")]
 [assembly: AssemblyCopyright("MIT License")]
 
 // ============================================================
@@ -35,6 +35,8 @@ static class Th
     public static readonly Color Bar = Hex("#141827");
     public const int BarH = 54;
     public const int WinRad = 16;
+    // 用 DWM 圆角时改成 8，和系统圆角对齐；区域裁剪时保持 16
+    public static int CornerRadius = WinRad;
     public static readonly Color Side = Hex("#11141D");
     public static readonly Color Card = Hex("#161A26");
     public static readonly Color CardHot = Hex("#1B2033");
@@ -160,6 +162,21 @@ static class Th
         if (w < rad * 2 || h < rad * 2) return;
         using (GraphicsPath p = Round(new Rectangle(0, 0, w, h), rad))
             f.Region = new Region(p);
+    }
+
+    [DllImport("dwmapi.dll")]
+    static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
+    // Win11 的 DWM 圆角是抗锯齿的；区域裁剪（Region）永远是硬边，1080p 下能看到台阶。
+    // 成功返回 true，这时不要再设 Region，否则又会切回硬边。
+    public static bool RoundWindow(Form f)
+    {
+        try
+        {
+            int pref = 2; // DWMWCP_ROUND
+            return DwmSetWindowAttribute(f.Handle, 33, ref pref, sizeof(int)) == 0;
+        }
+        catch { return false; }
     }
 
     // 卡片底板
@@ -639,16 +656,22 @@ static class HonorEc
 
     public static byte[] Call(byte group, byte cmd, byte value)
     {
+        byte[] inp = new byte[64];
+        inp[0] = group;
+        inp[1] = cmd;
+        inp[2] = value;
+        return CallRaw(inp);
+    }
+
+    // WMI 一次收 64 字节，前三字节是 group/cmd/值，剩下的是这类指令的负载。
+    public static byte[] CallRaw(byte[] payload)
+    {
         ManagementObject o = Inst();
         if (o == null) return null;
         try
         {
-            byte[] inp = new byte[64];
-            inp[0] = group;
-            inp[1] = cmd;
-            inp[2] = value;
             ManagementBaseObject pin = o.GetMethodParameters("OemWMIfun");
-            pin["u8Input"] = inp;
+            pin["u8Input"] = payload;
             ManagementBaseObject pout = o.InvokeMethod("OemWMIfun", pin, null);
             if (pout == null) return null;
             return pout["u8Output"] as byte[];
@@ -658,6 +681,164 @@ static class HonorEc
             Error = ex.Message;
             return null;
         }
+    }
+
+    // GPU 功耗三元组：group 3 / cmd 0x17，[2]=0xFF 表示后面带数据，
+    // [3]=TGP-60，[4]=温度墙，[5]=CPU 瓦数。和 HNSDK_SetGPUToCPUMaxPower 逐字节一致。
+    public static int WattTgp = 100;
+    public static int WattTemp = 87;
+    public static int WattCpu = 140;
+    public static string WattError = "";
+    public static bool WattApplied;
+    public static string WattVariant = "";
+    public static string WattReport = "";
+    public static int WattPrefer = -1;
+
+    // 电池充电阈值：读 group 3 / cmd 0x11（参数 0xFF），回包 [1]=恢复%、[2]=上限%；
+    // 写 group 3 / cmd 0x10，[2]=恢复%、[3]=上限%。实测 40/80 能写进去并读回。
+    public static int BatStop = -1;
+    public static int BatResume = -1;
+    public static readonly int[] BatStopPreset = new int[] { 70, 90, 100 };
+    public static readonly int[] BatResumePreset = new int[] { 40, 70, 95 };
+    public static string BatError = "";
+
+    public static bool ReadBatteryLimit()
+    {
+        byte[] p = new byte[64];
+        p[0] = 0x03;
+        p[1] = 0x11;
+        p[2] = 0xFF;
+        byte[] r = CallRaw(p);
+        if (r == null || r.Length < 3 || r[0] != 0) { BatError = r == null ? "EC 无响应" : "读取失败"; return false; }
+        BatResume = r[1];
+        BatStop = r[2];
+        return true;
+    }
+
+    public static bool SetBatteryLimit(int stop, int resume)
+    {
+        if (stop < 60 || stop > 100) { BatError = "上限只能是 60–100%"; return false; }
+        if (resume < 30 || resume > stop - 5) { BatError = "恢复点必须低于上限"; return false; }
+        byte[] p = new byte[64];
+        p[0] = 0x03;
+        p[1] = 0x10;
+        p[2] = (byte)resume;
+        p[3] = (byte)stop;
+        byte[] r = CallRaw(p);
+        if (r == null || r.Length == 0 || r[0] != 0) { BatError = r == null ? "EC 无响应" : ("EC 返回 " + r[0]); return false; }
+        if (!ReadBatteryLimit() || BatStop != stop || BatResume != resume)
+        {
+            BatError = "写进去了但读回来不一致：" + BatStop + "/" + BatResume;
+            return false;
+        }
+        BatError = "";
+        return true;
+    }
+
+    static string[] VarName = new string[] { "A", "B", "C", "D" };
+
+    public static int VariantIndex(string name)
+    {
+        for (int i = 0; i < VarName.Length; i++) if (VarName[i] == name) return i;
+        return -1;
+    }
+
+    // 同一个 group 3 指令在这台机器上试过的几种排布：
+    // A = 营地的写法（[2]=0xFF，数据在 3/4/5）
+    // B = 不写标记，数据在 3/4/5
+    // C = 数据整体前移到 2/3/4
+    // D = cmd 换成 0x16
+    static byte[] BuildWatt(int kind, int tgp, int temp, int cpu)
+    {
+        byte[] p = new byte[64];
+        p[0] = 0x03;
+        p[1] = kind == 3 ? (byte)0x16 : (byte)0x17;
+        if (kind == 0) { p[2] = 0xFF; p[3] = (byte)(tgp - 60); p[4] = (byte)temp; p[5] = (byte)cpu; }
+        else if (kind == 1) { p[2] = 0x00; p[3] = (byte)(tgp - 60); p[4] = (byte)temp; p[5] = (byte)cpu; }
+        else if (kind == 2) { p[2] = (byte)(tgp - 60); p[3] = (byte)temp; p[4] = (byte)cpu; }
+        else { p[2] = 0xFF; p[3] = (byte)(tgp - 60); p[4] = (byte)temp; p[5] = (byte)cpu; }
+        return p;
+    }
+
+    static bool SendWatt(int kind, int tgp, int temp, int cpu, out byte[] raw)
+    {
+        raw = CallRaw(BuildWatt(kind, tgp, temp, cpu));
+        return raw != null && raw.Length > 0 && raw[0] == 0;
+    }
+
+    public static bool SetGpuWatt(int tgp, int temp, int cpuWatt)
+    {
+        if (tgp < 60 || tgp > 115) { WattError = "TGP 只能是 60–115 W"; return false; }
+        if (temp < 75 || temp > 87) { WattError = "温度墙只能是 75–87 ℃"; return false; }
+        if (cpuWatt < 30 || cpuWatt > 160) { WattError = "CPU 功耗只能是 30–160 W"; return false; }
+        StringBuilder rep = new StringBuilder();
+        int[] order = new int[4];
+        if (WattPrefer >= 0 && WattPrefer < 4)
+            for (int i = 0; i < 4; i++) order[i] = (WattPrefer + i) & 3;
+        else
+            for (int i = 0; i < 4; i++) order[i] = i;
+        for (int n = 0; n < 4; n++)
+        {
+            int kind = order[n];
+            byte[] raw;
+            bool ok = SendWatt(kind, tgp, temp, cpuWatt, out raw);
+            rep.Append(VarName[kind]).Append('=').Append(raw == null ? "无响应" : raw[0].ToString());
+            if (n < 3) rep.Append(" · ");
+            if (ok)
+            {
+                WattTgp = tgp;
+                WattTemp = temp;
+                WattCpu = cpuWatt;
+                WattApplied = true;
+                WattVariant = VarName[kind];
+                WattPrefer = kind;
+                WattError = "";
+                WattReport = rep.ToString();
+                return true;
+            }
+        }
+        WattError = "EC 拒绝了写入（" + rep + "）";
+        WattReport = rep.ToString();
+        return false;
+    }
+
+    // 把几种排布和几档 TGP 都跑一遍，结果落到 %APPDATA%\HonorTune\power-diag.txt
+    public static string WattDiag(int temp, int cpu)
+    {
+        StringBuilder sb = new StringBuilder();
+        sb.AppendLine("HonorTune 功耗墙诊断 " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+        sb.AppendLine("温度墙=" + temp + " CPU=" + cpu);
+        int[] tgps = new int[] { 0, 60, 80, 100 };
+        foreach (int t in tgps)
+        {
+            int tgp = t == 0 ? WattTgp : t;
+            sb.Append("TGP " + tgp + " (" + (tgp - 60) + ") :");
+            for (int kind = 0; kind < 4; kind++)
+            {
+                byte[] raw;
+                bool ok = SendWatt(kind, tgp, temp, cpu, out raw);
+                sb.Append("  ").Append(VarName[kind]).Append('=');
+                if (raw == null) sb.Append("null");
+                else
+                {
+                    sb.Append(raw[0]).Append(ok ? "(OK)" : "");
+                    sb.Append('[');
+                    for (int i = 1; i < Math.Min(8, raw.Length); i++)
+                        sb.Append(raw[i].ToString("X2")).Append(i < 7 ? " " : "");
+                    sb.Append(']');
+                }
+            }
+            sb.AppendLine();
+        }
+        string dir = System.IO.Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "HonorTune");
+        try
+        {
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(System.IO.Path.Combine(dir, "power-diag.txt"), sb.ToString(), Encoding.UTF8);
+        }
+        catch { }
+        return sb.ToString();
     }
 
     static int Word(byte[] b)
@@ -840,6 +1021,279 @@ static class HonorEc
         if (m == 3) return "高能";
         if (m < 0) return "—";
         return "模式 " + m;
+    }
+}
+
+// ============================================================
+//  GPU 频率偏移。和猎人营地 HNSDK.dll 同一条路：
+//  nvapi64!nvapi_QueryInterface → NvAPI_GPU_SetPstates20 (0x0F4DAE6B)
+//  结构版本 0x31CF8，只改 P0 的一个 clock，单位 kHz。
+//  核心 domain=0，显存 domain=4。界面上的 MHz 在这里乘 1000，和猎人营地相同。
+// ============================================================
+static class GpuOc
+{
+    public const int CoreMax = 200;
+    public const int MemMax = 400;
+    const int StructSize = 0x1CF8;
+    const int Ver = 0x00031CF8;
+    const uint IdInit = 0x0150E828;
+    const uint IdEnum = 0xE5AC921F;
+    const uint IdSet = 0x0F4DAE6B;
+    const uint IdGet = 0x6FF81213;
+    const int PrivDenied = -137;
+
+    public static int CoreMhz;
+    public static int MemMhz;
+    public static int LiveCore = -1;
+    public static int LiveMem = -1;
+    public static bool Ready;
+    public static string Error = "";
+    public static string Status = "尚未下发";
+
+    delegate IntPtr QueryFn(uint id);
+    delegate int InitFn();
+    delegate int EnumFn(IntPtr handles, IntPtr count);
+    delegate int SetFn(IntPtr gpu, IntPtr info);
+
+    static QueryFn query;
+    static IntPtr gpu;
+    static bool opened;
+
+    public static void Load(Cfg cfg)
+    {
+        CoreMhz = Clamp(cfg.GetInt("gpu", "core", 0), 0, CoreMax);
+        MemMhz = Clamp(cfg.GetInt("gpu", "mem", 0), 0, MemMax);
+    }
+
+    public static int Clamp(int v, int lo, int hi)
+    {
+        if (v < lo) return lo;
+        if (v > hi) return hi;
+        return v;
+    }
+
+    public static bool Probe()
+    {
+        return Ensure();
+    }
+
+    public static bool Apply(int coreMhz, int memMhz)
+    {
+        coreMhz = Clamp(coreMhz, 0, CoreMax);
+        memMhz = Clamp(memMhz, 0, MemMax);
+        if (!Ensure()) return false;
+        int c = SetDomain(0, coreMhz * 1000);
+        int m = SetDomain(4, memMhz * 1000);
+        if (c != 0 || m != 0)
+        {
+            Error = (c == PrivDenied || m == PrivDenied)
+                ? "需要管理员权限，驱动拒绝了这次写入"
+                : "NVAPI 核心 " + Hex(c) + " · 显存 " + Hex(m);
+            Status = "下发失败";
+            opened = false;
+            return false;
+        }
+        ReadLive();
+        if (LiveCore >= 0) coreMhz = LiveCore;
+        if (LiveMem >= 0) memMhz = LiveMem;
+        CoreMhz = coreMhz;
+        MemMhz = memMhz;
+        Error = "";
+        Status = coreMhz == 0 && memMhz == 0
+            ? "已还原为 0"
+            : "已下发 核心 +" + coreMhz + " · 显存 +" + memMhz + " MHz";
+        return true;
+    }
+
+    public static bool ReadLive()
+    {
+        if (!Ensure()) return false;
+        IntPtr fn = query(IdGet);
+        if (fn == IntPtr.Zero) return false;
+        IntPtr mem = Marshal.AllocHGlobal(StructSize);
+        try
+        {
+            for (int i = 0; i < StructSize; i++) Marshal.WriteByte(mem, i, 0);
+            Marshal.WriteInt32(mem, Ver);
+            int rc = ((SetFn)Marshal.GetDelegateForFunctionPointer(fn, typeof(SetFn)))(gpu, mem);
+            if (rc != 0) return false;
+            LiveCore = Clamp(Marshal.ReadInt32(mem, 0x28) / 1000, 0, CoreMax);
+            LiveMem = Clamp(Marshal.ReadInt32(mem, 0x54) / 1000, 0, MemMax);
+            return true;
+        }
+        catch { return false; }
+        finally { Marshal.FreeHGlobal(mem); }
+    }
+
+    public static string ApplyResultPath()
+    {
+        string dir = System.IO.Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "HonorTune");
+        try { Directory.CreateDirectory(dir); } catch { }
+        return System.IO.Path.Combine(dir, "gpu-apply.txt");
+    }
+
+    public static void WriteApplyResult(bool ok, int core, int mem, string error, string extra)
+    {
+        try
+        {
+            File.WriteAllText(ApplyResultPath(),
+                (ok ? "ok" : "fail") + "\r\n" + core + "\r\n" + mem + "\r\n" + (error ?? "") + "\r\n" + (extra ?? "") + "\r\n",
+                Encoding.UTF8);
+        }
+        catch { }
+    }
+
+    static string Hex(int rc)
+    {
+        return "0x" + ((uint)rc).ToString("X8");
+    }
+
+    static bool Ensure()
+    {
+        if (opened && gpu != IntPtr.Zero && query != null) return true;
+        try
+        {
+            IntPtr mod = LoadLibrary("nvapi64.dll");
+            if (mod == IntPtr.Zero)
+            {
+                Error = "找不到 nvapi64.dll";
+                Status = "没有 NVIDIA 驱动";
+                return false;
+            }
+            IntPtr q = GetProcAddress(mod, "nvapi_QueryInterface");
+            if (q == IntPtr.Zero)
+            {
+                Error = "nvapi_QueryInterface 不存在";
+                return false;
+            }
+            query = (QueryFn)Marshal.GetDelegateForFunctionPointer(q, typeof(QueryFn));
+            IntPtr init = query(IdInit);
+            if (init == IntPtr.Zero)
+            {
+                Error = "NvAPI_Initialize 未导出";
+                return false;
+            }
+            int rc = ((InitFn)Marshal.GetDelegateForFunctionPointer(init, typeof(InitFn)))();
+            if (rc != 0)
+            {
+                Error = "NvAPI_Initialize " + Hex(rc);
+                return false;
+            }
+            IntPtr en = query(IdEnum);
+            if (en == IntPtr.Zero)
+            {
+                Error = "NvAPI_EnumPhysicalGPUs 未导出";
+                return false;
+            }
+            IntPtr handles = Marshal.AllocHGlobal(64 * IntPtr.Size);
+            IntPtr countPtr = Marshal.AllocHGlobal(4);
+            try
+            {
+                for (int i = 0; i < 64 * IntPtr.Size; i++) Marshal.WriteByte(handles, i, 0);
+                Marshal.WriteInt32(countPtr, 0);
+                rc = ((EnumFn)Marshal.GetDelegateForFunctionPointer(en, typeof(EnumFn)))(handles, countPtr);
+                int count = Marshal.ReadInt32(countPtr);
+                gpu = count > 0 ? Marshal.ReadIntPtr(handles) : IntPtr.Zero;
+                if (rc != 0 || count < 1 || gpu == IntPtr.Zero)
+                {
+                    Error = "没有枚举到独显 " + Hex(rc);
+                    return false;
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(handles);
+                Marshal.FreeHGlobal(countPtr);
+            }
+            if (query(IdSet) == IntPtr.Zero)
+            {
+                Error = "NvAPI_GPU_SetPstates20 未导出";
+                return false;
+            }
+            opened = true;
+            Ready = true;
+            if (Status == "尚未下发" || Status.Length == 0) Status = "NVAPI 已就绪";
+            Error = "";
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Error = ex.Message;
+            opened = false;
+            return false;
+        }
+    }
+
+    static int SetDomain(int domain, int khz)
+    {
+        IntPtr fn = query(IdSet);
+        if (fn == IntPtr.Zero) return -1;
+        byte[] buf = new byte[StructSize];
+        WriteI32(buf, 0x00, Ver);
+        WriteI32(buf, 0x08, 1);
+        WriteI32(buf, 0x0C, 1);
+        WriteI32(buf, 0x1C, domain);
+        WriteI32(buf, 0x28, khz);
+        IntPtr mem = Marshal.AllocHGlobal(StructSize);
+        try
+        {
+            Marshal.Copy(buf, 0, mem, StructSize);
+            SetFn set = (SetFn)Marshal.GetDelegateForFunctionPointer(fn, typeof(SetFn));
+            return set(gpu, mem);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(mem);
+        }
+    }
+
+    static void WriteI32(byte[] b, int off, int v)
+    {
+        b[off] = (byte)v;
+        b[off + 1] = (byte)(v >> 8);
+        b[off + 2] = (byte)(v >> 16);
+        b[off + 3] = (byte)(v >> 24);
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
+    static extern IntPtr LoadLibrary(string name);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Ansi)]
+    static extern IntPtr GetProcAddress(IntPtr module, string name);
+}
+
+// ============================================================
+//  荣耀自己的那一组数
+//  来源：C:\Program Files\HONOR\HunterCamp\Xml\HunterCampCustomMode.xml
+//  GPUBase(5060/5070) 给 TGP/温度墙/CPU 功耗，GPUAdvanced 给超频。
+//  营地应用一次预设时是一起下发的，这里照同样方式打包。
+// ============================================================
+static class HonorProfile
+{
+    public const int Tgp = 100;
+    public const int Temp = 87;
+    public const int Cpu = 140;
+    public const int Core = 150;
+    public const int Mem = 300;
+    public const int OneCore = 200;
+    public const int OneMem = 400;
+
+    public static bool ApplyPower(Cfg cfg, out string msg)
+    {
+        bool ok = HonorEc.SetGpuWatt(Tgp, Temp, Cpu);
+        if (ok)
+        {
+            cfg.Set("power", "tgp", Tgp.ToString());
+            cfg.Set("power", "temp", Temp.ToString());
+            cfg.Set("power", "cpu", Cpu.ToString());
+            cfg.Set("power", "variant", HonorEc.WattVariant);
+            cfg.Save();
+            msg = "功耗墙同步荣耀数值：TGP " + Tgp + " W · 温度墙 " + Temp + " ℃ · CPU " + Cpu
+                + " W（编码 " + HonorEc.WattVariant + "）";
+        }
+        else msg = "功耗墙没写进去：" + HonorEc.WattError;
+        return ok;
     }
 }
 
@@ -1204,6 +1658,11 @@ class Metrics
     public double Mhz = -1;
     public double GpuTemp = -1;
     public double GpuUtil = -1;
+    public int GpuSm = -1;
+    public int GpuMemClk = -1;
+    public int GpuPowerLimit = -1;
+    public int GpuPowerDefault = -1;
+    public int GpuPowerMax = -1;
     public string GpuName = "";
 
     ulong prevIdle, prevKernel, prevUser;
@@ -1280,7 +1739,7 @@ class Metrics
                 string exe = System.IO.Path.Combine(Environment.SystemDirectory, "nvidia-smi.exe");
                 if (!File.Exists(exe)) { GpuTemp = -1; return; }
                 ProcessStartInfo psi = new ProcessStartInfo(exe,
-                    "--query-gpu=name,temperature.gpu,utilization.gpu --format=csv,noheader,nounits");
+                    "--query-gpu=name,temperature.gpu,utilization.gpu,clocks.sm,clocks.mem,power.limit,power.default_limit,power.max_limit --format=csv,noheader,nounits");
                 psi.UseShellExecute = false;
                 psi.RedirectStandardOutput = true;
                 psi.CreateNoWindow = true;
@@ -1295,6 +1754,16 @@ class Metrics
                         double v;
                         if (double.TryParse(parts[1].Trim(), out v)) GpuTemp = v;
                         if (double.TryParse(parts[2].Trim(), out v)) GpuUtil = v;
+                        int clk;
+                        if (parts.Length >= 5 && int.TryParse(parts[3].Trim(), out clk)) GpuSm = clk;
+                        if (parts.Length >= 5 && int.TryParse(parts[4].Trim(), out clk)) GpuMemClk = clk;
+                        int pw;
+                        if (parts.Length >= 8)
+                        {
+                            GpuPowerLimit = int.TryParse(parts[5].Trim(), out pw) ? pw : -1;
+                            GpuPowerDefault = int.TryParse(parts[6].Trim(), out pw) ? pw : -1;
+                            GpuPowerMax = int.TryParse(parts[7].Trim(), out pw) ? pw : -1;
+                        }
                     }
                 }
             }
@@ -1424,6 +1893,15 @@ class NavBtn : Px
                 g.DrawEllipse(p, cx - 3, cy - 8, 6, 6);
                 using (SolidBrush fill = new SolidBrush(Th.Side)) g.FillEllipse(fill, cx + 1, cy + 2, 6, 6);
                 g.DrawEllipse(p, cx + 1, cy + 2, 6, 6);
+            }
+            else if (Index == 2)
+            {
+                // 电池：外壳 + 正极 + 电量条
+                Rectangle body = new Rectangle(cx - 8, cy - 5, 14, 10);
+                g.DrawRectangle(p, body);
+                g.DrawLine(p, cx + 7, cy - 2, cx + 7, cy + 2);
+                using (SolidBrush fill = new SolidBrush(Th.Alpha(ic, 200)))
+                    g.FillRectangle(fill, body.X + 2, body.Y + 2, 5, body.Height - 4);
             }
             else
             {
@@ -1621,7 +2099,7 @@ class Slider : Px
 
     void SetFromX(int x)
     {
-        int pad = 8;
+        int pad = 12;
         int w = Width - pad * 2;
         int v = _min + (int)Math.Round((double)(Math.Max(0, Math.Min(w, x - pad))) / w * (_max - _min));
         if (v != _val)
@@ -1637,7 +2115,7 @@ class Slider : Px
     {
         Graphics g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
-        int pad = 8;
+        int pad = 12;
         int cy = Height / 2;
         double t = _max == _min ? 0 : (double)(_val - _min) / (_max - _min);
         int kx = pad + (int)((Width - pad * 2) * t);
@@ -1720,7 +2198,7 @@ class MainForm : Form
     System.Windows.Forms.Timer tick;
     int page = 0;
 
-    NavBtn[] navs = new NavBtn[2];
+    NavBtn[] navs = new NavBtn[4];
     WinBtn winMin, winClose;
     Toggle tgAnim, tgBg, tgBoot;
     Slider slDelay;
@@ -1728,6 +2206,23 @@ class MainForm : Form
     PillBtn[] quick = new PillBtn[3];
     PillBtn[] hwFan = new PillBtn[5];
     PillBtn btnRestore;
+    Slider slCore, slMem;
+    PillBtn btnGpuApply, btnGpuReset, btnGpuHonor, btnGpuOne;
+    Toggle tgBat, tgAuto;
+    PillBtn[] batSeg = new PillBtn[3];
+    int batMode = 1;
+    bool batOn = true;
+    bool autoMode = true;
+    int autoPreset = -1;
+    bool ecoForced;
+    bool gpuWait;
+    int gpuWaitCore, gpuWaitMem;
+    DateTime gpuWaitSince;
+
+    // 荣耀自己用的那组数，见 HonorProfile
+    const int HonorTgp = HonorProfile.Tgp, HonorTemp = HonorProfile.Temp, HonorCpu = HonorProfile.Cpu;
+    const int HonorCore = HonorProfile.Core, HonorMem = HonorProfile.Mem;
+    const int OneCore = HonorProfile.OneCore, OneMem = HonorProfile.OneMem;
 
     List<string[]> logs = new List<string[]>();
     double[] hist = new double[60];
@@ -1740,6 +2235,16 @@ class MainForm : Form
     public MainForm(int startPage)
     {
         cfg = Cfg.Load();
+        GpuOc.Load(cfg);
+        HonorEc.WattTgp = Math.Max(60, Math.Min(100, cfg.GetInt("power", "tgp", 100)));
+        HonorEc.WattTemp = Math.Max(75, Math.Min(87, cfg.GetInt("power", "temp", 87)));
+        HonorEc.WattCpu = Math.Max(30, Math.Min(140, cfg.GetInt("power", "cpu", 140)));
+        HonorEc.WattPrefer = HonorEc.VariantIndex(cfg.Get("power", "variant", ""));
+        batMode = Math.Max(0, Math.Min(2, cfg.GetInt("battery", "mode", 1)));
+        batOn = cfg.Get("battery", "on", "1") != "0";
+        autoMode = cfg.Get("auto", "on", "1") != "0";
+        autoPreset = cfg.GetInt("auto", "preset", -1);
+        SyncAutoKeep();
         core = new Core(cfg);
         core.OnLog += AppendLog;
         core.EnsureSnapshot();
@@ -1747,7 +2252,6 @@ class MainForm : Form
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.CenterScreen;
         ClientSize = new Size(W, H);
-        Th.ClipWindow(this, Th.WinRad);
         BackColor = Th.Bg;
         Text = "荣耀性能调控";
         try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
@@ -1757,6 +2261,8 @@ class MainForm : Form
         BuildChrome();
         BuildPage0();
         BuildPage2();
+        BuildGpuPage();
+        BuildBatteryPage();
         BuildRestore();
 
         Disp.Load();
@@ -1771,6 +2277,11 @@ class MainForm : Form
         AppendLog("启动完成 · " + ModelName() + " · " + DateTime.Now.ToString("HH:mm"), true);
 
         if (!Env.Writable) AppendLog("检测到受限运行环境，修改可能不会生效", false);
+
+        // Win11 用 DWM 圆角（抗锯齿），拿不到再退回区域裁剪
+        dwmRound = Th.RoundWindow(this);
+        if (!dwmRound) Th.ClipWindow(this, Th.WinRad);
+        else { Th.CornerRadius = 8; Region = null; }
 
         tick = new System.Windows.Forms.Timer();
         tick.Interval = 1000;
@@ -1801,6 +2312,8 @@ class MainForm : Form
     {
         mon.Sample();
         if (histCount % 2 == 0) HonorEc.Refresh();
+        if (page == 1 && histCount % 2 == 0) PollGpu();
+        AutoTick();
         HighlightHonor();
         hist[histCount % hist.Length] = mon.Cpu;
         histCount++;
@@ -1834,8 +2347,8 @@ class MainForm : Form
         winMin.Click += delegate { WindowState = FormWindowState.Minimized; };
         Controls.Add(winMin);
 
-        string[] names = new string[] { "概览", "细节调节" };
-        for (int i = 0; i < 2; i++)
+        string[] names = new string[] { "概览", "GPU 超频", "电池保护", "细节调节" };
+        for (int i = 0; i < navs.Length; i++)
         {
             NavBtn b = new NavBtn();
             b.Index = i;
@@ -1868,7 +2381,7 @@ class MainForm : Form
             PillBtn p = new PillBtn();
             p.Text = t[i];
             p.Accent = colors[i];
-            p.Bounds = new Rectangle(270 + i * 118, 248, 108, 34);
+            p.Bounds = new Rectangle(268 + i * 138, 248, 120, 34);
             p.Tag = modes[i];
             p.Click += HwModeClick;
             quick[i] = p;
@@ -1879,7 +2392,7 @@ class MainForm : Form
         {
             PillBtn p = new PillBtn();
             p.Text = fans[i];
-            p.Bounds = new Rectangle(270 + i * 92, 352, 86, 32);
+            p.Bounds = new Rectangle(268 + i * 82, 352, 70, 32);
             p.Tag = i;
             p.Click += HwFanClick;
             hwFan[i] = p;
@@ -1914,6 +2427,312 @@ class MainForm : Form
             c.Visible = false;
             chips.Add(c);
             Controls.Add(c);
+        }
+    }
+
+    void BuildGpuPage()
+    {
+        slCore = new Slider();
+        slCore.Bounds = new Rectangle(324, 322, 560, 26);
+        slCore.Min = 0;
+        slCore.Max = GpuOc.CoreMax;
+        slCore.Value = GpuOc.CoreMhz;
+        slCore.Changed += delegate { if (!syncing) Invalidate(); };
+        Controls.Add(slCore);
+
+        slMem = new Slider();
+        slMem.Bounds = new Rectangle(324, 368, 560, 26);
+        slMem.Min = 0;
+        slMem.Max = GpuOc.MemMax;
+        slMem.Value = GpuOc.MemMhz;
+        slMem.Changed += delegate { if (!syncing) Invalidate(); };
+        Controls.Add(slMem);
+
+        btnGpuApply = new PillBtn();
+        btnGpuApply.Text = "应用偏移";
+        btnGpuApply.Primary = true;
+        btnGpuApply.Bounds = new Rectangle(268, 414, 128, 34);
+        btnGpuApply.Click += GpuApplyClick;
+        Controls.Add(btnGpuApply);
+
+        btnGpuReset = new PillBtn();
+        btnGpuReset.Text = "还原为 0";
+        btnGpuReset.Bounds = new Rectangle(408, 414, 128, 34);
+        btnGpuReset.Click += GpuResetClick;
+        Controls.Add(btnGpuReset);
+
+        btnGpuHonor = new PillBtn();
+        btnGpuHonor.Text = "荣耀 " + HonorCore + "/" + HonorMem;
+        btnGpuHonor.Bounds = new Rectangle(548, 414, 150, 34);
+        btnGpuHonor.Click += GpuHonorClick;
+        Controls.Add(btnGpuHonor);
+
+        btnGpuOne = new PillBtn();
+        btnGpuOne.Text = "一键 " + OneCore + "/" + OneMem;
+        btnGpuOne.Bounds = new Rectangle(708, 414, 150, 34);
+        btnGpuOne.Click += GpuOneClick;
+        Controls.Add(btnGpuOne);
+    }
+
+    void GpuHonorClick(object s, EventArgs e)
+    {
+        if (syncing) return;
+        syncing = true;
+        slCore.Value = HonorCore;
+        slMem.Value = HonorMem;
+        syncing = false;
+        AppendLog("已填入荣耀自定义档：核心 +" + HonorCore + " · 显存 +" + HonorMem + " MHz，点「应用偏移」写入", true);
+        Invalidate();
+    }
+
+    void GpuOneClick(object s, EventArgs e)
+    {
+        if (syncing) return;
+        syncing = true;
+        slCore.Value = OneCore;
+        slMem.Value = OneMem;
+        syncing = false;
+        AppendLog("已填入荣耀一键档：核心 +" + OneCore + " · 显存 +" + OneMem + " MHz，点「应用偏移」写入", true);
+        Invalidate();
+    }
+
+    void GpuApplyClick(object s, EventArgs e)
+    {
+        if (syncing) return;
+        int core = slCore.Value;
+        int mem = slMem.Value;
+        if (!Elev.IsAdmin())
+        {
+            try
+            {
+                gpuWait = true;
+                gpuWaitCore = core;
+                gpuWaitMem = mem;
+                gpuWaitSince = DateTime.Now;
+                Elev.Relaunch("--gpu-oc " + core + " " + mem);
+                AppendLog("请在 UAC 中允许，才会把核心 +" + core + "、显存 +" + mem + " MHz 写进驱动", true);
+            }
+            catch
+            {
+                gpuWait = false;
+                AppendLog("未获得管理员权限，偏移没有写入", false);
+            }
+            Invalidate();
+            return;
+        }
+        bool ok = GpuOc.Apply(core, mem);
+        if (ok)
+        {
+            syncing = true;
+            slCore.Value = GpuOc.CoreMhz;
+            slMem.Value = GpuOc.MemMhz;
+            syncing = false;
+            RememberGpu(GpuOc.CoreMhz, GpuOc.MemMhz);
+        }
+        AppendLog(ok ? GpuOc.Status : ("GPU 偏移失败：" + GpuOc.Error), ok);
+        if (ok && (core > 0 || mem > 0))
+        {
+            string msg;
+            bool pok = HonorProfile.ApplyPower(cfg, out msg);
+            AppendLog(msg, pok);
+        }
+        Invalidate();
+    }
+
+    void PollGpu()
+    {
+        GpuOc.ReadLive();
+        if (!gpuWait) return;
+        if ((DateTime.Now - gpuWaitSince).TotalSeconds > 90)
+        {
+            gpuWait = false;
+            AppendLog("UAC 等待超时，偏移可能没写进去", false);
+            return;
+        }
+        string path = GpuOc.ApplyResultPath();
+        if (!File.Exists(path) || File.GetLastWriteTime(path) < gpuWaitSince.AddSeconds(-1)) return;
+        string[] lines;
+        try { lines = File.ReadAllLines(path, Encoding.UTF8); }
+        catch { return; }
+        gpuWait = false;
+        bool ok = lines.Length > 0 && lines[0] == "ok";
+        int c, m;
+        if (ok && lines.Length > 2 && int.TryParse(lines[1], out c) && int.TryParse(lines[2], out m))
+        {
+            syncing = true;
+            slCore.Value = c;
+            slMem.Value = m;
+            syncing = false;
+            cfg.Set("gpu", "core", c.ToString());
+            cfg.Set("gpu", "mem", m.ToString());
+            AppendLog("已通过 UAC 写入 核心 +" + c + " · 显存 +" + m + " MHz", true);
+            if (lines.Length > 4 && lines[4].Trim().Length > 0)
+                AppendLog(lines[4].Trim(), lines[4].IndexOf("没写进去") < 0);
+        }
+        else
+        {
+            string err = lines.Length > 3 ? lines[3] : "未知错误";
+            AppendLog("UAC 后写入失败：" + err, false);
+        }
+    }
+
+    void RememberGpu(int core, int mem)
+    {
+        cfg.Set("gpu", "core", core.ToString());
+        cfg.Set("gpu", "mem", mem.ToString());
+        cfg.Save();
+        GpuOc.CoreMhz = core;
+        GpuOc.MemMhz = mem;
+        Boot.PublishKeep(cfg.GetInt("keep", "mode", HonorEc.Mode), cfg.GetInt("keep", "fan", HonorEc.FanIndex),
+            cfg.Get("keep", "startup", "1") != "0");
+    }
+
+    void GpuResetClick(object s, EventArgs e)
+    {
+        if (syncing) return;
+        syncing = true;
+        slCore.Value = 0;
+        slMem.Value = 0;
+        syncing = false;
+        GpuApplyClick(s, e);
+    }
+
+    void BuildBatteryPage()
+    {
+        tgBat = new Toggle();
+        tgBat.Bounds = new Rectangle(1080, 262, 52, 28);
+        tgBat.Changed += delegate
+        {
+            if (syncing) return;
+            batOn = tgBat.On;
+            ApplyBattery();
+        };
+        Controls.Add(tgBat);
+
+        string[] names = new string[] { "家用 70%", "办公 90%", "差旅 100%" };
+        for (int i = 0; i < 3; i++)
+        {
+            PillBtn p = new PillBtn();
+            p.Text = names[i];
+            p.Bounds = new Rectangle(268 + i * 288, 352, 260, 34);
+            p.Tag = i;
+            p.Click += BatClick;
+            batSeg[i] = p;
+            Controls.Add(p);
+        }
+
+        tgAuto = new Toggle();
+        tgAuto.Bounds = new Rectangle(1080, 462, 52, 28);
+        tgAuto.Changed += delegate
+        {
+            if (syncing) return;
+            autoMode = tgAuto.On;
+            cfg.Set("auto", "on", autoMode ? "1" : "0");
+            cfg.Save();
+            ecoForced = false;
+            SyncAutoKeep();
+          };
+        Controls.Add(tgAuto);
+    }
+
+    void BatClick(object s, EventArgs e)
+    {
+        if (syncing) return;
+        batMode = (int)((Control)s).Tag;
+        if (!batOn)
+        {
+            batOn = true;
+            syncing = true;
+            tgBat.On = true;
+            syncing = false;
+        }
+        ApplyBattery();
+    }
+
+    void ApplyBattery()
+    {
+        int stop = batOn ? HonorEc.BatStopPreset[batMode] : 100;
+        int resume = batOn ? HonorEc.BatResumePreset[batMode] : 95;
+        bool ok = HonorEc.SetBatteryLimit(stop, resume);
+        if (ok)
+        {
+            cfg.Set("battery", "mode", batMode.ToString());
+            cfg.Set("battery", "on", batOn ? "1" : "0");
+            cfg.Save();
+            AppendLog(batOn
+                ? "充电阈值已设为 上限 " + stop + "% · 掉到 " + resume + "% 再充"
+                : "已关闭充电上限，充到 100%", true);
+        }
+        else AppendLog("充电阈值写入失败：" + HonorEc.BatError, false);
+        SyncBattery();
+        Invalidate();
+    }
+
+    void SyncBattery()
+    {
+        HonorEc.ReadBatteryLimit();
+        syncing = true;
+        tgBat.On = batOn;
+        tgAuto.On = autoMode;
+        for (int i = 0; i < batSeg.Length; i++)
+        {
+            batSeg[i].Primary = i == batMode && batOn;
+            batSeg[i].Invalidate();
+        }
+        syncing = false;
+    }
+
+    void SyncAutoKeep()
+    {
+        Boot.Preset = autoPreset;
+        Boot.AutoOn = autoMode ? 1 : 0;
+        Boot.PublishKeep(cfg.GetInt("keep", "mode", HonorEc.Mode),
+            cfg.GetInt("keep", "fan", HonorEc.FanIndex),
+            cfg.Get("keep", "startup", "1") != "0");
+    }
+
+    // 不插电强制智能档；插电且电量 > 20% 切回用户之前选的档位
+    void AutoTick()
+    {
+        if (!autoMode) return;
+        PowerStatus ps = SystemInformation.PowerStatus;
+        bool ac = ps.PowerLineStatus == PowerLineStatus.Online;
+        int pct = (int)Math.Round(ps.BatteryLifePercent * 100);
+
+        if (!ac)
+        {
+            if (!ecoForced)
+            {
+                if (HonorEc.Mode == 1 || HonorEc.Mode == 3)
+                {
+                    autoPreset = HonorEc.Mode;
+                    cfg.Set("auto", "preset", autoPreset.ToString());
+                    cfg.Save();
+                    SyncAutoKeep();
+                }
+                ecoForced = true;
+            }
+            if (HonorEc.Mode != 0 && HonorEc.SetMode(0))
+            {
+                Remember(0, -1);
+                AppendLog("未接电源，已切到智能档", true);
+                HighlightHonor();
+            }
+            return;
+        }
+
+        if (ecoForced && pct > 20)
+        {
+            ecoForced = false;
+            int back = (autoPreset == 1 || autoPreset == 3) ? autoPreset : 1;
+            if (HonorEc.Mode != back)
+            {
+                int fan = back == 3 ? cfg.GetInt("keep", "fan", HonorEc.FanIndex) : -1;
+                ApplyHonorChoice(back, fan);
+                Remember(back, fan);
+                AppendLog("已接电源且电量 " + pct + "%，切回" + (back == 1 ? "性能档" : "高能档"), true);
+                HighlightHonor();
+            }
         }
     }
 
@@ -1999,10 +2818,23 @@ class MainForm : Form
     void HwModeClick(object s, EventArgs e)
     {
         int mode = (int)((Control)s).Tag;
+        if (mode != 0 && !OnAcPower())
+        {
+            AppendLog("未接电源时只能选智能档，插上电源再切", false);
+            HighlightHonor();
+            return;
+        }
         int fan = cfg.GetInt("keep", "fan", HonorEc.FanIndex);
         string msg = ApplyHonorChoice(mode, mode == 3 ? fan : -1);
         bool ok = HonorEc.Mode == mode;
         if (ok) Remember(mode, mode == 3 ? fan : -1);
+        if (ok && (mode == 1 || mode == 3))
+        {
+            autoPreset = mode;
+            cfg.Set("auto", "preset", autoPreset.ToString());
+            cfg.Save();
+            SyncAutoKeep();
+        }
         AppendLog(msg, ok);
         HighlightHonor();
         Invalidate();
@@ -2124,13 +2956,21 @@ class MainForm : Form
         catch { }
     }
 
+    bool OnAcPower()
+    {
+        return SystemInformation.PowerStatus.PowerLineStatus == PowerLineStatus.Online;
+    }
+
     void HighlightHonor()
     {
         int[] qModes = new int[] { 0, 1, 3 };
+        bool ac = OnAcPower();
         for (int i = 0; i < 3; i++)
         {
             if (quick[i] == null) continue;
             quick[i].Primary = HonorEc.Mode == qModes[i];
+            // 未接电源时不给选性能档和高能档
+            quick[i].Enabled = ac || qModes[i] == 0;
             quick[i].Invalidate();
         }
         bool fanOn = HonorEc.Mode == 3 && HonorEc.FanTableOk;
@@ -2146,13 +2986,23 @@ class MainForm : Form
     void ShowPage(int idx)
     {
         page = idx;
-        for (int i = 0; i < 2; i++) { navs[i].Active = i == idx; navs[i].Invalidate(); }
+        for (int i = 0; i < navs.Length; i++) { navs[i].Active = i == idx; navs[i].Invalidate(); }
         for (int i = 0; i < 5; i++) hwFan[i].Visible = idx == 0;
         quick[0].Visible = quick[1].Visible = quick[2].Visible = idx == 0;
-        tgAnim.Visible = tgBg.Visible = slDelay.Visible = idx == 1;
+        bool detail = idx == 3;
+        tgAnim.Visible = tgBg.Visible = slDelay.Visible = detail;
         foreach (Chip c in chips) c.Visible = false;
-        if (idx == 1) BuildRateChips();
-        btnRestore.Visible = idx == 1;
+        if (detail) BuildRateChips();
+        btnRestore.Visible = detail;
+        bool gpu = idx == 1;
+        slCore.Visible = slMem.Visible = btnGpuApply.Visible = btnGpuReset.Visible = gpu;
+        btnGpuHonor.Visible = btnGpuOne.Visible = gpu;
+        if (gpu) { GpuOc.Probe(); GpuOc.ReadLive(); }
+        bool bat = idx == 2;
+        tgBat.Visible = bat;
+        tgAuto.Visible = bat;
+        for (int i = 0; i < batSeg.Length; i++) batSeg[i].Visible = bat;
+        if (bat) SyncBattery();
         Invalidate();
     }
 
@@ -2185,7 +3035,7 @@ class MainForm : Form
             c.Bounds = new Rectangle(startX + i * (cw + gap), 206, cw, 34);
             c.Text = hz + " Hz";
             c.Selected = hz == Disp.Hz;
-            c.Visible = page == 1;
+            c.Visible = page == 3;
             int target = hz;
             c.Click -= ChipClick;
             c.Click += ChipClick;
@@ -2230,7 +3080,7 @@ class MainForm : Form
             d.StartPosition = FormStartPosition.CenterScreen;
             d.ClientSize = new Size(400, 150);
             d.BackColor = Th.Card;
-            Th.ClipWindow(d, 12);
+            if (!Th.RoundWindow(d)) Th.ClipWindow(d, 12);
             d.TopMost = true;
             d.ShowInTaskbar = false;
 
@@ -2352,9 +3202,11 @@ class MainForm : Form
 
         // 侧栏底部
         Th.TL(g, ModelName(), Th.FTiny, Th.Text3, 22, H - 92, SideW - 40, 16);
-        Th.TL(g, "v1.3.2 · 荣耀性能调整", Th.FTiny, Th.Alpha(Th.Text3, 160), 22, H - 72, SideW - 40, 16);
+        Th.TL(g, "v1.4.0 · 荣耀性能调整", Th.FTiny, Th.Alpha(Th.Text3, 160), 22, H - 72, SideW - 40, 16);
 
         if (page == 0) PaintPage0(g);
+        else if (page == 1) PaintGpu(g);
+        else if (page == 2) PaintBattery(g);
         else PaintPage2(g);
 
         if (!Env.Writable)
@@ -2362,7 +3214,7 @@ class MainForm : Form
                 Th.FTiny, Th.Warn, 300, 15, 776, 24);
 
         Th.Frame(g, new Rectangle(1, 1, ClientSize.Width - 3, ClientSize.Height - 3),
-            Th.WinRad - 1, Th.Hex("#2B3448"));
+            Th.CornerRadius - 1, Th.Hex("#2B3448"));
     }
 
     void Header(Graphics g, string title, string sub)
@@ -2385,9 +3237,9 @@ class MainForm : Form
 
     void PaintPage0(Graphics g)
     {
-        Header(g, "概览", "当前荣耀性能档与实时负载");
+        Header(g, "概览", "当前档位与实时负载");
 
-        Rectangle mc = new Rectangle(246, 132, 520, 268);
+        Rectangle mc = new Rectangle(246, 132, 444, 268);
         Th.Fill(g, mc, 12, Th.Card);
         Th.Frame(g, mc, 12, Th.Stroke);
         Th.TL(g, "当前模式", Th.FTiny, Th.Text3, mc.X + 24, mc.Y + 14, 200, 16);
@@ -2406,8 +3258,6 @@ class MainForm : Form
 
         Th.TL(g, tag.Length == 0 ? "—" : tag, Th.FHero, Th.Text,
             mc.X + 84, mc.Y + 40, 260, 32);
-        Th.TL(g, tag.Length == 0 ? "尚未读到荣耀性能档" : "荣耀性能档",
-            Th.FTiny, c1, mc.X + 84, mc.Y + 72, 260, 16);
 
         Th.TL(g, "风扇 " + Rpm(HonorEc.Fan0) + " / " + Rpm(HonorEc.Fan1),
             Th.FSmall, Th.Text2, mc.X + 24, mc.Y + 188, 300, 18);
@@ -2415,12 +3265,12 @@ class MainForm : Form
             : (HonorEc.Mode == 3 ? "可调整" : "仅高能档可调");
         bool fanReady = HonorEc.FanTableOk && HonorEc.Mode == 3;
         Th.TL(g, fanHint,
-            Th.FTiny, fanReady ? Th.Ok : Th.Text3, mc.X + 330, mc.Y + 188, 160, 18);
+            Th.FTiny, fanReady ? Th.Ok : Th.Text3, mc.Right - 150, mc.Y + 188, 130, 18);
 
-        // 右侧两块指标
-        DrawTile(g, new Rectangle(786, 132, 368, 114), "CPU 占用", mon.Cpu.ToString("0") + "%", null,
+        // 右侧两块指标：宽度和总高度都与左侧「当前模式」对齐
+        DrawTile(g, new Rectangle(710, 132, 444, 128), "CPU 占用", mon.Cpu.ToString("0") + "%", null,
             "实时", Th.A1, true);
-        DrawTile(g, new Rectangle(786, 258, 368, 114), "内存", mon.MemUsedGb.ToString("0.0") + " / " +
+        DrawTile(g, new Rectangle(710, 272, 444, 128), "内存", mon.MemUsedGb.ToString("0.0") + " / " +
             mon.MemTotalGb.ToString("0.0") + " GB", null, mon.MemPct.ToString("0") + "% 使用中", Th.A2, false);
 
         // 第二排
@@ -2532,6 +3382,63 @@ class MainForm : Form
         Th.TL(g, "从首次运行前的状态还原，可反复执行", Th.FTiny, Th.Text3, c4.X + 22, 698, 600, 20);
     }
 
+    void PaintGpu(Graphics g)
+    {
+        Header(g, "GPU 超频", "和猎人营地同一条 NVAPI 偏移，只抬 P0 的核心和显存，不锁死频率");
+
+        Rectangle info = new Rectangle(246, 132, 908, 112);
+        Th.CardBox(g, info, "当前独显", GpuOc.Ready ? "NVAPI 已连通" : "点应用时才会真正下发");
+        string name = mon.GpuName.Length > 0 ? mon.GpuName : "NVIDIA GPU";
+        Th.TL(g, name, Th.FSmall, Th.Text, info.X + 22, info.Y + 58, 520, 22);
+        string live = GpuOc.LiveCore < 0 ? "尚未读到驱动偏移"
+            : "显卡实际 核心 +" + GpuOc.LiveCore + " · 显存 +" + GpuOc.LiveMem + " MHz";
+        Th.TL(g, live, Th.FTiny, Th.Text3, info.X + 22, info.Y + 82, 560, 18);
+        Th.TR(g, GpuOc.Status, Th.FSmall, GpuOc.Error.Length > 0 ? Th.Bad : Th.Ok,
+            info.Right - 360, info.Y + 58, 336, 22);
+
+        Rectangle card = new Rectangle(246, 256, 908, 230);
+        Th.CardBox(g, card, "频率偏移", "拖动后要点「应用偏移」才会写入驱动");
+        Th.TL(g, "核心", Th.FSmall, Th.Text2, card.X + 22, 322, 52, 26);
+        Th.TL(g, "+" + slCore.Value + " MHz", Th.FSmall, Th.A1, 896, 322, 120, 26);
+        Th.TL(g, "显存", Th.FSmall, Th.Text2, card.X + 22, 368, 52, 26);
+        Th.TL(g, "+" + slMem.Value + " MHz", Th.FSmall, Th.A1, 896, 368, 120, 26);
+        Th.TL(g, "核心 0–" + GpuOc.CoreMax + " · 显存 0–" + GpuOc.MemMax + "。过高可能花屏或掉驱动，不稳就还原为 0",
+            Th.FTiny, Th.Text3, card.X + 22, 458, 860, 18);
+    }
+
+    void PaintBattery(Graphics g)
+    {
+        Header(g, "电池保护", "到上限就停充，掉到恢复点再充。写的是荣耀 EC 里那组阈值");
+
+        Rectangle info = new Rectangle(246, 132, 908, 112);
+        Th.CardBox(g, info, "电池状态", "电量来自 Windows，阈值来自 EC");
+        PowerStatus ps = SystemInformation.PowerStatus;
+        int pct = (int)Math.Round(ps.BatteryLifePercent * 100);
+        bool ch = (ps.BatteryChargeStatus & BatteryChargeStatus.Charging) != 0;
+        string ac = ps.PowerLineStatus == PowerLineStatus.Online ? "已接电源" : "使用电池";
+        Th.TL(g, pct + "%", Th.FNum, Th.Text, info.X + 22, info.Y + 58, 120, 34);
+        Th.TL(g, ac + " · " + (ch ? "充电中" : "未充电"), Th.FSmall, Th.Text2,
+            info.X + 150, info.Y + 64, 320, 22);
+        string cur = HonorEc.BatStop < 0 ? "EC 里的阈值还没读到"
+            : "EC 当前：上限 " + HonorEc.BatStop + "% · 掉到 " + HonorEc.BatResume + "% 再充";
+        Th.TR(g, cur, Th.FTiny, Th.Text3, info.Right - 420, info.Y + 64, 398, 20);
+
+        Rectangle card = new Rectangle(246, 256, 908, 300);
+        Th.CardBox(g, card, "充电上限", batOn ? "开启：到上限停充，掉到恢复点再充" : "已关闭：一直充到 100%");
+        Th.TL(g, batOn ? "开启" : "关闭", Th.FSmall, batOn ? Th.Ok : Th.Text3,
+            card.Right - 130, 266, 60, 24);
+        Th.TL(g, "三档只是预设，EC 里存的是「上限 / 恢复」两个百分比。",
+            Th.FTiny, Th.Text3, card.X + 22, 316, 860, 18);
+        Th.TL(g, "选的这档会用上面的开关状态一起下发。",
+            Th.FTiny, Th.Text3, card.X + 22, 404, 860, 18);
+        Th.TL(g, "家用 70% 长期插电最护电池；办公 90%；差旅 100% 等于不限制。",
+            Th.FTiny, Th.Text3, card.X + 22, 428, 860, 18);
+        Th.TL(g, "不插电自动切智能档，插电且电量高于 20% 切回之前选的档位。",
+            Th.FSmall, Th.Text2, card.X + 22, 466, 780, 22);
+        if (HonorEc.BatError.Length > 0)
+            Th.TL(g, HonorEc.BatError, Th.FTiny, Th.Bad, card.X + 22, 520, 860, 18);
+    }
+
     static string Trim(string s, int n)
     {
         if (s == null) return "";
@@ -2550,13 +3457,15 @@ class MainForm : Form
     }
 
     Size clipped;
+    bool dwmRound;
 
     protected override void OnResize(EventArgs e)
     {
         base.OnResize(e);
         if (WindowState == FormWindowState.Minimized || clipped == ClientSize) return;
         clipped = ClientSize;
-        Th.ClipWindow(this, Th.WinRad);
+        // 用 DWM 圆角时不能设 Region，否则又会变成硬边
+        if (!dwmRound) Th.ClipWindow(this, Th.WinRad);
     }
 
     // ---------- 无边框窗口拖动 ----------
@@ -2660,6 +3569,43 @@ static class Cli
                 case "--diag":
                     sb.AppendLine(Diag.Dump(args.Length > 1 ? args[1] : LogPath()));
                     break;
+                case "--gpu-oc":
+                    if (args.Length > 2)
+                    {
+                        int gCore = int.Parse(args[1]);
+                        int gMem = int.Parse(args[2]);
+                        bool ok = GpuOc.Apply(gCore, gMem);
+                        sb.AppendLine(ok ? GpuOc.Status : ("FAIL " + GpuOc.Error));
+                        string pmsg = "";
+                        if (ok)
+                        {
+                            cfg.Set("gpu", "core", GpuOc.CoreMhz.ToString());
+                            cfg.Set("gpu", "mem", GpuOc.MemMhz.ToString());
+                            cfg.Save();
+                            Boot.PublishGpu(GpuOc.CoreMhz, GpuOc.MemMhz);
+                            if (GpuOc.CoreMhz > 0 || GpuOc.MemMhz > 0)
+                            {
+                                HonorProfile.ApplyPower(cfg, out pmsg);
+                                sb.AppendLine(pmsg);
+                            }
+                        }
+                        GpuOc.WriteApplyResult(ok, GpuOc.CoreMhz, GpuOc.MemMhz, GpuOc.Error, pmsg);
+                    }
+                    else sb.AppendLine("用法: --gpu-oc <核心MHz> <显存MHz>");
+                    break;
+                case "--power-diag":
+                    sb.Append(HonorEc.WattDiag(
+                        cfg.GetInt("power", "temp", 87), cfg.GetInt("power", "cpu", 140)));
+                    break;
+                case "--battery-probe":
+                    sb.Append(BatteryProbe.Run(args));
+                    break;
+                case "--gpu-reset":
+                    sb.AppendLine(GpuOc.Apply(0, 0) ? GpuOc.Status : ("FAIL " + GpuOc.Error));
+                    break;
+                case "--gpu-probe":
+                    sb.AppendLine(GpuOc.Probe() ? "NVAPI ready" : ("FAIL " + GpuOc.Error));
+                    break;
                 default:
                     sb.AppendLine("未知参数: " + args[0]);
                     break;
@@ -2672,6 +3618,270 @@ static class Cli
 
         try { File.WriteAllText(LogPath(), sb.ToString(), Encoding.UTF8); } catch { }
         try { Console.Out.Flush(); } catch { }
+    }
+}
+
+// ============================================================
+//  电池充电上限试探
+//  荣耀这边不是 group 3，而是 group 6。PowerPolicyPlugin 里一共用了
+//  0x12 0x13 0x1B 0x25 0x26 0x34 0x3C 0x3F 这八条，静态看不出哪条是充电上限，
+//  只能一条条发、看充电状态。参数默认 80% 停 / 40% 恢复，随时能用管家改回去。
+// ============================================================
+static class BatteryProbe
+{
+    public static string Path()
+    {
+        string dir = System.IO.Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "HonorTune");
+        try { Directory.CreateDirectory(dir); } catch { }
+        return System.IO.Path.Combine(dir, "battery-probe.txt");
+    }
+
+    static string State()
+    {
+        PowerStatus ps = SystemInformation.PowerStatus;
+        int pct = (int)Math.Round(ps.BatteryLifePercent * 100);
+        string ac = ps.PowerLineStatus == PowerLineStatus.Online ? "已接电源" : "电池供电";
+        bool charging = (ps.BatteryChargeStatus & BatteryChargeStatus.Charging) != 0;
+        return pct + "%  " + ac + "  " + (charging ? "充电中" : "未充电");
+    }
+
+    static string Hex(byte[] b)
+    {
+        return Hex(b, 10);
+    }
+
+    static string Hex(byte[] b, int n)
+    {
+        if (b == null) return "null";
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < Math.Min(n, b.Length); i++)
+            sb.Append(b[i].ToString("X2")).Append(i < n - 1 ? " " : "");
+        return sb.ToString();
+    }
+
+    static readonly int[] Candidates = new int[] { 0x25, 0x26, 0x1B, 0x34, 0x3C, 0x3F, 0x12, 0x13 };
+
+    static bool Charging()
+    {
+        return (SystemInformation.PowerStatus.BatteryChargeStatus & BatteryChargeStatus.Charging) != 0;
+    }
+
+    static bool OnAc()
+    {
+        return SystemInformation.PowerStatus.PowerLineStatus == PowerLineStatus.Online;
+    }
+
+    static byte[] SecRead()
+    {
+        byte[] p = new byte[64];
+        p[0] = 0x03;
+        p[1] = 0x11;
+        p[2] = 0xFF;
+        return HonorEc.CallRaw(p);
+    }
+
+    static bool Has(byte[] b, int v)
+    {
+        if (b == null) return false;
+        for (int i = 0; i < b.Length; i++) if (b[i] == (byte)v) return true;
+        return false;
+    }
+
+    static bool Same(byte[] a, byte[] b)
+    {
+        if (a == null || b == null) return false;
+        for (int i = 0; i < Math.Min(a.Length, b.Length); i++) if (a[i] != b[i]) return false;
+        return true;
+    }
+
+    static byte[] Send(int cmd, int hi, int lo)
+    {
+        return SendRaw(cmd, hi, lo);
+    }
+
+    static byte[] SendRaw(int cmd, int hi, int lo)
+    {
+        byte[] p = new byte[64];
+        p[0] = 0x06;
+        p[1] = (byte)cmd;
+        p[2] = (byte)hi;
+        p[3] = (byte)lo;
+        return HonorEc.CallRaw(p);
+    }
+
+    // 判断标准：现在电池是「未充电」，发一条 100/95，如果它开始充电，就说明这条是充电上限。
+    public static string Run(string[] args)
+    {
+        StringBuilder sb = new StringBuilder();
+        sb.AppendLine("HonorTune 电池充电试探 " + DateTime.Now.ToString("HH:mm:ss"));
+        if (args.Length < 2)
+        {
+            sb.AppendLine("用法: --battery-probe all          依次试八条候选，用 100/95 看是否开始充电");
+            sb.AppendLine("      --battery-probe <命令号> [上限%] [恢复%]");
+            sb.AppendLine("候选: 0x25 0x26 0x1B 0x34 0x3C 0x3F 0x12 0x13");
+            return Finish(sb);
+        }
+        if (!OnAc())
+        {
+            sb.AppendLine("请先接上电源再试");
+            return Finish(sb);
+        }
+        sb.AppendLine("电池 前: " + State());
+
+        string mode = args[1].Trim();
+        if (mode.Equals("sec", StringComparison.OrdinalIgnoreCase))
+        {
+            // 0x11 是 HNSDK_IsSecBatteryManageOpen 用的查询命令（group 3），
+            // 写命令按惯例是相邻的 0x10，写完再读 0x11 看有没有变。
+            sb.AppendLine("读 group=3 cmd=0x11 参数 0xFF:");
+            byte[] a = SecRead();
+            sb.AppendLine("  [" + Hex(a, 16) + "]");
+            if (a == null) return Finish(sb);
+            for (int v = 1; v <= 3; v++)
+            {
+                byte[] wp = new byte[64];
+                wp[0] = 0x03; wp[1] = 0x10; wp[2] = (byte)v;
+                byte[] wr = HonorEc.CallRaw(wp);
+                System.Threading.Thread.Sleep(300);
+                byte[] r2 = SecRead();
+                sb.AppendLine("写 0x10=" + v + "  返回[" + Hex(wr, 6) + "]  再读[" + Hex(r2, 16) + "]");
+                if (r2 != null && a.Length == r2.Length && !Same(a, r2))
+                {
+                    sb.AppendLine(">>> 0x10 写进去了，读到变化，值 " + v);
+                    break;
+                }
+            }
+            return Finish(sb);
+        }
+        if (mode.Equals("secset", StringComparison.OrdinalIgnoreCase))
+        {
+            // 0x11 读到 [1]=0x46(70) [2]=0x5A(90)，就是「70% 恢复 / 90% 停止」。
+            // 写命令按同样的字节顺序试，写完用 0x11 读回来验证。
+            byte[] a = SecRead();
+            sb.AppendLine("当前 [" + Hex(a, 16) + "]");
+            int stop = 80, resume = 40;
+            int[] cmds = new int[] { 0x10, 0x12, 0x0F, 0x1F };
+            int okCmd = -1, okLayout = -1;
+            foreach (int c in cmds)
+            {
+                for (int lay = 0; lay < 2 && okCmd < 0; lay++)
+                {
+                    byte[] wp = new byte[64];
+                    wp[0] = 0x03;
+                    wp[1] = (byte)c;
+                    wp[2] = (byte)(lay == 0 ? stop : resume);
+                    wp[3] = (byte)(lay == 0 ? resume : stop);
+                    byte[] wr = HonorEc.CallRaw(wp);
+                    System.Threading.Thread.Sleep(400);
+                    byte[] r2 = SecRead();
+                    bool hit = Has(r2, stop) && Has(r2, resume);
+                    sb.AppendLine("写 0x" + c.ToString("X2") + " " + stop + "/" + resume
+                        + " 返回[" + Hex(wr, 6) + "] 读回[" + Hex(r2, 16) + "]" + (hit ? "  <<< 对上了" : ""));
+                    if (hit) { okCmd = c; okLayout = lay; break; }
+                }
+                if (okCmd >= 0) break;
+            }
+            if (okCmd < 0)
+            {
+                sb.AppendLine("都没对上，写命令不是这几条或参数顺序不同");
+                return Finish(sb);
+            }
+            // 还原成 90/70，别把机器留在 80/40
+            byte[] rp = new byte[64];
+            rp[0] = 0x03;
+            rp[1] = (byte)okCmd;
+            rp[2] = (byte)(okLayout == 0 ? 90 : 70);
+            rp[3] = (byte)(okLayout == 0 ? 70 : 90);
+            HonorEc.CallRaw(rp);
+            System.Threading.Thread.Sleep(400);
+            sb.AppendLine("已还原 90/70，读回 [" + Hex(SecRead(), 16) + "]");
+            sb.AppendLine(">>> 写命令是 0x" + okCmd.ToString("X2") + "，参数顺序 " + (okLayout == 0 ? "上限,恢复" : "恢复,上限"));
+            return Finish(sb);
+        }
+        if (mode.Equals("all", StringComparison.OrdinalIgnoreCase))
+        {
+            if (Charging())
+            {
+                sb.AppendLine("现在已经在充电，判断不了。先等它停充（比如到 90%）再试");
+                return Finish(sb);
+            }
+            int found = -1;
+            foreach (int c in Candidates)
+            {
+                byte[] rr = SendRaw(c, 0, 0);
+                if (rr == null || rr.Length == 0)
+                {
+                    sb.AppendLine("cmd 0x" + c.ToString("X2") + "  无响应");
+                    continue;
+                }
+                string hex = Hex(rr, 16);
+                string mark = "";
+                for (int k = 1; k < Math.Min(16, rr.Length); k++)
+                {
+                    if (rr[k] == 0x5A) mark += "  含 5A(90%)@+" + k;
+                    else if (rr[k] == 0x46) mark += "  含 46(70%)@+" + k;
+                    else if (rr[k] == 0x64) mark += "  含 64(100%)@+" + k;
+                }
+                sb.AppendLine("cmd 0x" + c.ToString("X2") + "  [" + hex + "]" + mark);
+                if (rr[0] != 0) continue;
+                for (int i = 0; i < 4; i++)
+                {
+                    System.Threading.Thread.Sleep(1000);
+                    if (Charging()) { found = c; break; }
+                }
+                if (found >= 0)
+                {
+                    sb.AppendLine(">>> 0x" + found.ToString("X2") + " 让电池开始充电");
+                    break;
+                }
+            }
+            if (found >= 0)
+                sb.AppendLine(">>> 现在会充到 100%。要回到 90% 用: --battery-probe 0x"
+                    + found.ToString("X2") + " 90 70");
+            else sb.AppendLine("没有一条让它开始充电；看上面哪条的回包里带 5A/46/64，那条更可能是读上限的");
+            return Finish(sb);
+        }
+
+        int cmd;
+        string cs = mode;
+        try
+        {
+            cmd = cs.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+                ? Convert.ToInt32(cs.Substring(2), 16) : Convert.ToInt32(cs);
+        }
+        catch { sb.AppendLine("命令号看不懂: " + cs); return Finish(sb); }
+
+        int hi = 100, lo = 95;
+        if (args.Length > 2) int.TryParse(args[2], out hi);
+        if (args.Length > 3) int.TryParse(args[3], out lo);
+
+        sb.AppendLine("发送 group=6 cmd=0x" + cmd.ToString("X2") + "  上限 " + hi + "%  恢复 " + lo + "%");
+        byte[] res = Send(cmd, hi, lo);
+        sb.AppendLine("EC 返回 [" + Hex(res, 16) + "]  状态 " +
+            (res == null || res.Length == 0 ? "无响应" : res[0].ToString("X2")));
+        bool was = Charging();
+        for (int i = 0; i < 15; i++)
+        {
+            System.Threading.Thread.Sleep(2000);
+            sb.AppendLine("  +" + ((i + 1) * 2) + "s  " + State());
+            if (!was && Charging())
+            {
+                sb.AppendLine(">>> 开始充电了，这条就是充电上限");
+                break;
+            }
+        }
+        return Finish(sb);
+    }
+
+    static string Finish(StringBuilder sb)
+    {
+        string s = sb.ToString();
+        try { File.AppendAllText(Path(), s + "\r\n", Encoding.UTF8); } catch { }
+        // 这个程序是窗口程序，从“运行”里启动不会有控制台，结果直接弹出来
+        try { MessageBox.Show(s, "电池充电试探 · 结果", MessageBoxButtons.OK, MessageBoxIcon.Information); }
+        catch { }
+        return s;
     }
 }
 
@@ -2824,6 +4034,10 @@ static class Boot
         return Sc("query " + SvcName) == 0;
     }
 
+    // 插电自动切档：preset 是用户选的档位，auto=1 表示启用
+    public static int Preset = -1;
+    public static int AutoOn = -1;
+
     public static void PublishKeep(int mode, int fan, bool on)
     {
         try
@@ -2832,16 +4046,42 @@ static class Boot
             sb.AppendLine("mode=" + mode);
             sb.AppendLine("fan=" + fan);
             sb.AppendLine("on=" + (on ? "1" : "0"));
+            sb.AppendLine("gpucore=" + GpuOc.CoreMhz);
+            sb.AppendLine("gpumem=" + GpuOc.MemMhz);
+            if (Preset >= 0) sb.AppendLine("preset=" + Preset);
+            if (AutoOn >= 0) sb.AppendLine("auto=" + AutoOn);
             File.WriteAllText(KeepPath(), sb.ToString(), Encoding.UTF8);
         }
         catch { }
     }
 
-    public static bool ReadKeep(out int mode, out int fan, out bool on)
+    public static void PublishGpu(int core, int mem)
+    {
+        GpuOc.CoreMhz = core;
+        GpuOc.MemMhz = mem;
+        int mode, fan, gc, gm;
+        bool on;
+        ReadKeep(out mode, out fan, out on, out gc, out gm);
+        if (mode != 0 && mode != 1 && mode != 3) mode = HonorEc.Mode;
+        PublishKeep(mode, fan, on);
+    }
+
+    public static bool ReadKeep(out int mode, out int fan, out bool on, out int gpuCore, out int gpuMem)
+    {
+        int preset, auto;
+        return ReadKeep(out mode, out fan, out on, out gpuCore, out gpuMem, out preset, out auto);
+    }
+
+    public static bool ReadKeep(out int mode, out int fan, out bool on, out int gpuCore, out int gpuMem,
+        out int preset, out int auto)
     {
         mode = -1;
         fan = -1;
         on = false;
+        gpuCore = 0;
+        gpuMem = 0;
+        preset = -1;
+        auto = -1;
         try
         {
             if (!File.Exists(KeepPath())) return false;
@@ -2854,7 +4094,13 @@ static class Boot
                 if (k == "mode") int.TryParse(v, out mode);
                 else if (k == "fan") int.TryParse(v, out fan);
                 else if (k == "on") on = v != "0";
+                else if (k == "gpucore") int.TryParse(v, out gpuCore);
+                else if (k == "gpumem") int.TryParse(v, out gpuMem);
+                else if (k == "preset") int.TryParse(v, out preset);
+                else if (k == "auto") int.TryParse(v, out auto);
             }
+            gpuCore = GpuOc.Clamp(gpuCore, 0, GpuOc.CoreMax);
+            gpuMem = GpuOc.Clamp(gpuMem, 0, GpuOc.MemMax);
             return mode == 0 || mode == 1 || mode == 3;
         }
         catch { return false; }
@@ -2865,10 +4111,13 @@ static class Boot
         try
         {
             Cfg cfg = Cfg.Load();
+            GpuOc.Load(cfg);
             HonorEc.Refresh();
             int mode = cfg.GetInt("keep", "mode", HonorEc.Mode);
             int fan = cfg.GetInt("keep", "fan", HonorEc.FanIndex);
             if (mode != 0 && mode != 1 && mode != 3) mode = HonorEc.Mode;
+            Preset = cfg.GetInt("auto", "preset", -1);
+            AutoOn = cfg.Get("auto", "on", "1") != "0" ? 1 : 0;
             PublishKeep(mode, fan, true);
             cfg.Set("keep", "startup", "1");
             if (mode == 0 || mode == 1 || mode == 3) cfg.Set("keep", "mode", mode.ToString());
@@ -3031,20 +4280,38 @@ class KeepService : ServiceBase
 
     void Tick(bool soon)
     {
-        int mode, fan;
+        int mode, fan, gpuCore, gpuMem, preset, auto;
         bool on;
-        if (!Boot.ReadKeep(out mode, out fan, out on) || !on) return;
+        if (!Boot.ReadKeep(out mode, out fan, out on, out gpuCore, out gpuMem, out preset, out auto) || !on) return;
         HonorEc.Refresh();
-        bool drift = HonorEc.Mode != mode;
-        if (mode == 3 && fan >= 0 && fan <= 4 && HonorEc.FanIndex != fan) drift = true;
+
+        // 插电自动切档：不插电强制智能档，插电且电量 > 20% 回到预设档
+        int target = mode;
+        if (auto == 1)
+        {
+            PowerStatus ps = SystemInformation.PowerStatus;
+            bool ac = ps.PowerLineStatus == PowerLineStatus.Online;
+            int pct = (int)Math.Round(ps.BatteryLifePercent * 100);
+            if (!ac) target = 0;
+            else if (pct <= 20) target = 0;
+            else if (preset == 1 || preset == 3) target = preset;
+        }
+
+        bool drift = HonorEc.Mode != target;
+        if (target == 3 && fan >= 0 && fan <= 4 && HonorEc.FanIndex != fan) drift = true;
         quiet++;
         bool reassert = soon || quiet >= 4;
+        if (reassert && (gpuCore > 0 || gpuMem > 0))
+        {
+            if (!GpuOc.Apply(gpuCore, gpuMem))
+                Boot.WriteLog("GPU 偏移未生效：" + GpuOc.Error);
+        }
         if (!drift && forced && !reassert) return;
         if (reassert) quiet = 0;
-        string msg = MainForm.ApplyHonorChoice(mode, fan);
+        string msg = MainForm.ApplyHonorChoice(target, fan);
         forced = true;
         if (drift || msg.IndexOf("失败") >= 0 || msg.IndexOf("未生效") >= 0)
-            Boot.WriteLog(msg);
+            Boot.WriteLog("目标档位 " + target + "：" + msg);
     }
 }
 
