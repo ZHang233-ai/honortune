@@ -4,8 +4,8 @@
 
 在 **HONOR MagicBook DRA-XX（DarwinA / Core Ultra 5 125H + RTX 4060）** 上开发并逐项实测。
 
-![概览](<img width="1180" height="740" alt="QQ_1793112560859" src="https://github.com/user-attachments/assets/e22c6ca4-1c91-4c63-80a5-b5333e0cfd9f" />
-)
+![概览]<img width="1180" height="740" alt="QQ_1793112744774" src="https://github.com/user-attachments/assets/d800303b-8589-4a4e-ab68-60d7fc62d464" />
+
 
 ---
 
